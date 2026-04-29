@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.csv
+
+# Ignore all .db files except the shipped seed
+*.db
+!seed/jobs.db
+
+# Runtime DB location — never tracked
+.lfp_accounting/
+
+# Note: CLAUDE.md and the .claude/ folder (project memory) ARE tracked
+# on purpose, so a new machine has full project context.

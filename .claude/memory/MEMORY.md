@@ -1,0 +1,2 @@
+- [LFP .accdb password](project_lfp_accdb_password.md) — Access DB password: 4DC1AE17E60EF174B252, extracted from process memory
+- [LFP project status](project_lfp_status.md) — Current state of the LFP replacement project, what's solved and what's blocked

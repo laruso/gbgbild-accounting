@@ -1,0 +1,5 @@
+# LFP Accounting — pull every 10 minutes
+# Install with: crontab -e   (then paste this line)
+# Cron is started automatically by the Pi at boot, so this survives reboots.
+
+*/10 * * * * cd /home/pi/lfp_accounting && /usr/bin/python3 lfp_accounting.py pull >> /home/pi/lfp_accounting/pull.log 2>&1

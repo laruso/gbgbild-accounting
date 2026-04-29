@@ -1,0 +1,13 @@
+[Unit]
+Description=Run LFP Accounting pull every 10 minutes
+
+[Timer]
+# Run 1 minute after boot, then every 10 minutes thereafter
+OnBootSec=1min
+OnUnitActiveSec=10min
+# If the Pi was off when a run was due, run it as soon as it comes back up
+Persistent=true
+Unit=lfp-accounting.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=LFP Accounting — pull job log from printer
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Edit User and WorkingDirectory to match where you cloned the repo
+User=pi
+WorkingDirectory=/home/pi/lfp_accounting
+ExecStart=/usr/bin/python3 /home/pi/lfp_accounting/lfp_accounting.py pull
+# Don't fail the unit on transient network errors
+SuccessExitStatus=0 1
