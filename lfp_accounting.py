@@ -10,15 +10,13 @@ Usage:
   python3 lfp_accounting.py export jobs.csv
   python3 lfp_accounting.py export-summary summary.csv
   python3 lfp_accounting.py send <index> [--resend]
-  python3 lfp_accounting.py send-batch [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--resend] [--article N]
+  python3 lfp_accounting.py send-batch [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--resend]
 
 Sending requires the Bearer token in the environment (never committed):
   export LFP_SEND_TOKEN=<token>
-  # optional: LFP_SEND_BASE_URL (test endpoint), LFP_SEND_ARTICLE (default articleNumber)
 """
 import argparse
 import csv
-import os
 import sys
 import logging
 from datetime import date, timedelta
@@ -251,9 +249,6 @@ def cmd_send_batch(args):
             "" if args.resend else " (all already sent, or none with user+ink)"))
         return
 
-    if args.article:
-        os.environ["LFP_SEND_ARTICLE"] = args.article
-
     try:
         result = senders.post_batch(sendable)
     except senders.SendError as e:
@@ -311,8 +306,6 @@ def main():
                               help="End date (default: last day of previous month)")
     p_send_batch.add_argument("--resend", action="store_true",
                               help="Include jobs already marked sent")
-    p_send_batch.add_argument("--article", metavar="N",
-                              help="Override articleNumber (default: %s)" % senders.DEFAULT_ARTICLE)
 
     p_export = sub.add_parser("export", help="Export jobs to CSV")
     p_export.add_argument("file", nargs="?", default="jobs.csv",

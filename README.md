@@ -258,7 +258,7 @@ the defaults.
 | `summary [--from D] [--to D]` | Per-user-per-month ink totals. With no range, rebuilds the persisted `monthly_ink_usage` table; with a range, computes the totals for that range without altering the table |
 | `export-summary [file]` | Rebuild the summary and write it to CSV (default `summary.csv`) |
 | `send <index> [--resend]` | Send a single job (by its `#` index from `list`) to the shop endpoint. Refuses jobs already sent unless `--resend` |
-| `send-batch [--from D] [--to D] [--resend] [--article N]` | Send many jobs in one request. Defaults to the entire previous calendar month. Skips already-sent jobs (unless `--resend`) and jobs with no user/ink data |
+| `send-batch [--from D] [--to D] [--resend]` | Send many jobs in one request. Defaults to the entire previous calendar month. Skips already-sent jobs (unless `--resend`) and jobs with no user/ink data |
 | `help` | Show all commands |
 
 ## Sending jobs to the shop endpoint
@@ -267,16 +267,12 @@ the defaults.
 so ink usage can be billed there. Both use only the Python standard library
 (no extra dependencies).
 
-### Configuration (environment variables)
+### Configuration
 
-The Bearer token is **never** stored in the repo — it's read from the
-environment at runtime:
-
-| Variable | Required | Purpose |
-|---|---|---|
-| `LFP_SEND_TOKEN` | **yes** | Bearer token sent as `Authorization: Bearer <token>` |
-| `LFP_SEND_BASE_URL` | no | Override the endpoint base URL (e.g. point at a local mock server for testing). Defaults to production |
-| `LFP_SEND_ARTICLE` | no | Override the `articleNumber` field. Defaults to `11` (also overridable per-call with `--article`) |
+The endpoint URL and `articleNumber` are fixed constants at the top of
+`senders.py` (`BASE_URL`, `ARTICLE_NUMBER`) — edit them there in the unlikely
+event they change. The **only** runtime setting is the Bearer token, which is
+**never** stored in the repo and is read from the environment:
 
 ```bash
 export LFP_SEND_TOKEN=<your-token>
@@ -300,8 +296,8 @@ A successful send stamps the job's `sent_at` column. `send-batch` skips any
 job already marked sent, so re-running it is safe and won't double-bill. Pass
 `--resend` to send already-sent jobs again. Endpoints:
 
-- Single: `POST <base>/`  (default base `https://shop.goteborgsbildverkstad.se/api/shop/printer01`)
-- Batch:  `POST <base>/batch`
+- Single: `POST https://shop.goteborgsbildverkstad.se/api/shop/printer01`
+- Batch:  `POST https://shop.goteborgsbildverkstad.se/api/shop/printer01/batch`
 
 ## How the ink decryption works
 

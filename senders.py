@@ -1,13 +1,12 @@
 """
 HTTP client for pushing print-job accounting data to the shop endpoint.
 
-Uses only the standard library (urllib). Configuration comes from the
-environment so no secrets live in the repo:
+Uses only the standard library (urllib). The endpoint URL and articleNumber are
+fixed constants below (edit them here if they ever change). The only runtime
+configuration is the Bearer token, read from the environment so it never lives
+in the repo:
 
     LFP_SEND_TOKEN     Bearer token (REQUIRED).
-    LFP_SEND_BASE_URL  Override the endpoint base URL (handy for testing
-                       against a local mock server). Defaults to production.
-    LFP_SEND_ARTICLE   Override the articleNumber. Defaults to "11".
 """
 import os
 import json
@@ -16,21 +15,13 @@ import urllib.error
 
 from joblog import INK_CHANNELS
 
-DEFAULT_BASE_URL = "https://shop.goteborgsbildverkstad.se/api/shop/printer01"
-DEFAULT_ARTICLE = "11"
+BASE_URL = "https://shop.goteborgsbildverkstad.se/api/shop/printer01"
+ARTICLE_NUMBER = "11"
 UNIT = "ml"
 
 
 class SendError(Exception):
     """Raised when a request cannot be built or the endpoint rejects it."""
-
-
-def _base_url() -> str:
-    return os.environ.get("LFP_SEND_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
-
-
-def article_number() -> str:
-    return os.environ.get("LFP_SEND_ARTICLE", DEFAULT_ARTICLE)
 
 
 def _token() -> str:
@@ -63,7 +54,7 @@ def job_payload(job: dict, include_article: bool = True) -> dict:
         "filename": job.get("job_name"),
     }
     if include_article:
-        payload["articleNumber"] = article_number()
+        payload["articleNumber"] = ARTICLE_NUMBER
     return payload
 
 
@@ -85,13 +76,13 @@ def _post(url: str, body: dict) -> dict:
 
 def post_single(job: dict) -> dict:
     """POST a single job to the printer endpoint."""
-    return _post(_base_url(), job_payload(job, include_article=True))
+    return _post(BASE_URL, job_payload(job, include_article=True))
 
 
 def post_batch(jobs: list[dict]) -> dict:
     """POST many jobs in one request (articleNumber hoisted to the top level)."""
     body = {
-        "articleNumber": article_number(),
+        "articleNumber": ARTICLE_NUMBER,
         "jobs": [job_payload(j, include_article=False) for j in jobs],
     }
-    return _post(_base_url() + "/batch", body)
+    return _post(BASE_URL + "/batch", body)
