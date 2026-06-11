@@ -3,11 +3,14 @@ Description=LFP Accounting — pull job log from printer
 Wants=network-online.target
 After=network-online.target
 
+# NOTE: This Pi actually runs the pull from the user crontab (see
+# crontab.example), NOT this unit. The service/timer are kept as an
+# equivalent systemd-based alternative. Edit User/WorkingDirectory/paths
+# below to match your install before enabling.
 [Service]
 Type=oneshot
-# Edit User and WorkingDirectory to match where you cloned the repo
-User=pi
-WorkingDirectory=/home/pi/lfp_accounting
-ExecStart=/usr/bin/python3 /home/pi/lfp_accounting/lfp_accounting.py pull
+User=gbgbild
+WorkingDirectory=/home/gbgbild/gbgbild-accounting
+ExecStart=/usr/bin/python3 /home/gbgbild/gbgbild-accounting/lfp_accounting.py --printer 192.168.1.55 pull
 # Don't fail the unit on transient network errors
 SuccessExitStatus=0 1

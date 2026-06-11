@@ -1,5 +1,12 @@
-# LFP Accounting — pull every 10 minutes
+# LFP Accounting — pull every 15 minutes
 # Install with: crontab -e   (then paste this line)
 # Cron is started automatically by the Pi at boot, so this survives reboots.
+#
+# This is the ACTIVE mechanism on the production Pi (the systemd unit/timer
+# in this folder are an unused alternative). Adjust the path, --printer IP,
+# and interval to match your install.
+#
+# pull.log is gitignored and grows over time; to cap it, rotate with logrotate
+# or periodically truncate (e.g. a weekly `: > pull.log` cron entry).
 
-*/10 * * * * cd /home/pi/lfp_accounting && /usr/bin/python3 lfp_accounting.py pull >> /home/pi/lfp_accounting/pull.log 2>&1
+*/15 * * * * cd /home/gbgbild/gbgbild-accounting && /usr/bin/python3 lfp_accounting.py --printer 192.168.1.55 pull >> /home/gbgbild/gbgbild-accounting/pull.log 2>&1

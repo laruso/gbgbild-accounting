@@ -2,6 +2,9 @@ __pycache__/
 *.pyc
 *.csv
 
+# Cron / runtime logs (e.g. pull.log) — never tracked
+*.log
+
 # Ignore all .db files except the shipped seed
 *.db
 !seed/jobs.db
