@@ -30,17 +30,28 @@ python lfp_accounting.py pull
 # See what's in the local database
 python lfp_accounting.py list
 
+# Limit the listing to a date range (inclusive)
+python lfp_accounting.py list --from 2026-05-01 --to 2026-05-31
+
 # Show current ink tank levels
 python lfp_accounting.py status
 
-# Build/refresh the per-user-per-month summary and print it
+# Per-user-per-month summary (optionally restricted to a date range)
 python lfp_accounting.py summary
+python lfp_accounting.py summary --from 2026-05-01 --to 2026-05-31
 
 # Export jobs to CSV
 python lfp_accounting.py export jobs.csv
 
 # Export the monthly summary to CSV
 python lfp_accounting.py export-summary summary.csv
+
+# Send a single job (use the # index from `list`) to the shop endpoint
+python lfp_accounting.py send 1
+
+# Send a batch (defaults to the entire previous calendar month)
+python lfp_accounting.py send-batch
+python lfp_accounting.py send-batch --from 2026-05-01 --to 2026-05-31
 
 # Show all commands
 python lfp_accounting.py help
@@ -111,6 +122,7 @@ them as regular files if you point it at them.)
 | `lfp_accounting.py` | Main CLI |
 | `joblog.py` | SNMP fetch + ink-blob decryption |
 | `store.py` | SQLite storage and monthly aggregation |
+| `senders.py` | Posts jobs to the shop endpoint (stdlib `urllib`, Bearer auth) |
 | `backfill_from_accdb.py` | One-time import from a legacy `.accdb` (Windows only — see below) |
 | `seed/jobs.db` | Pre-populated database with all historical data backfilled from the original `.accdb`. Copy to `~/.lfp_accounting/jobs.db` on first deploy. |
 | `archive/` | Reverse-engineering scripts kept for reference |
@@ -241,11 +253,55 @@ the defaults.
 |---|---|
 | `pull` | SNMP-pull the job log + ji: detail buffer from the printer, decrypt ink blobs, upsert into SQLite |
 | `status` | Show current ink tank levels |
-| `list [--limit N]` | Show recent jobs from the local DB |
+| `list [--limit N] [--from D] [--to D]` | Show recent jobs from the local DB, newest first, with a leading `#` index. `--from`/`--to` are inclusive `YYYY-MM-DD` filters |
 | `export [file]` | Write all jobs to CSV (default `jobs.csv`) |
-| `summary` | Rebuild the `monthly_ink_usage` table and print it |
+| `summary [--from D] [--to D]` | Per-user-per-month ink totals. With no range, rebuilds the persisted `monthly_ink_usage` table; with a range, computes the totals for that range without altering the table |
 | `export-summary [file]` | Rebuild the summary and write it to CSV (default `summary.csv`) |
+| `send <index> [--resend]` | Send a single job (by its `#` index from `list`) to the shop endpoint. Refuses jobs already sent unless `--resend` |
+| `send-batch [--from D] [--to D] [--resend] [--article N]` | Send many jobs in one request. Defaults to the entire previous calendar month. Skips already-sent jobs (unless `--resend`) and jobs with no user/ink data |
 | `help` | Show all commands |
+
+## Sending jobs to the shop endpoint
+
+`send` and `send-batch` POST job data to the Göteborgs Bildverkstad shop API
+so ink usage can be billed there. Both use only the Python standard library
+(no extra dependencies).
+
+### Configuration (environment variables)
+
+The Bearer token is **never** stored in the repo — it's read from the
+environment at runtime:
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `LFP_SEND_TOKEN` | **yes** | Bearer token sent as `Authorization: Bearer <token>` |
+| `LFP_SEND_BASE_URL` | no | Override the endpoint base URL (e.g. point at a local mock server for testing). Defaults to production |
+| `LFP_SEND_ARTICLE` | no | Override the `articleNumber` field. Defaults to `11` (also overridable per-call with `--article`) |
+
+```bash
+export LFP_SEND_TOKEN=<your-token>
+python lfp_accounting.py send-batch          # sends last month's jobs
+```
+
+If `LFP_SEND_TOKEN` is unset, the command exits with an error and sends nothing.
+
+### What gets sent
+
+Each job becomes one JSON object: `username`, `filename` (job name),
+`date` (`YYYY-MM-DD`), `quantity` (total ink in ml = sum of all 12 channels
+÷ 100), `unit` (`"ml"`), and `articleNumber`. A single `send` posts one such
+object; `send-batch` posts `{ "articleNumber": ..., "jobs": [ ... ] }`.
+
+Jobs with no username or no ink data are skipped (they can't be billed).
+
+### Duplicate protection
+
+A successful send stamps the job's `sent_at` column. `send-batch` skips any
+job already marked sent, so re-running it is safe and won't double-bill. Pass
+`--resend` to send already-sent jobs again. Endpoints:
+
+- Single: `POST <base>/`  (default base `https://shop.goteborgsbildverkstad.se/api/shop/printer01`)
+- Batch:  `POST <base>/batch`
 
 ## How the ink decryption works
 

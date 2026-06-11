@@ -57,7 +57,7 @@ def _ensure_schema(conn: sqlite3.Connection):
         ("InkUse_VM", "REAL"), ("InkUse_Y", "REAL"), ("InkUse_OR", "REAL"),
         ("InkUse_GR", "REAL"), ("InkUse_LC", "REAL"), ("InkUse_VLM", "REAL"),
         ("InkUse_LK", "REAL"), ("InkUse_LLK", "REAL"), ("InkUse_V", "REAL"),
-        ("ji_blob", "BLOB"),
+        ("ji_blob", "BLOB"), ("sent_at", "TEXT"),
     ]:
         try:
             conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {coltype}")
@@ -216,3 +216,97 @@ def all_jobs(db_path: Optional[Path] = None) -> list[dict]:
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def query_jobs(date_from: Optional[str] = None,
+               date_to: Optional[str] = None,
+               limit: Optional[int] = None,
+               unsent_only: bool = False,
+               db_path: Optional[Path] = None) -> list[dict]:
+    """Return jobs as dicts, newest first, filtered by date range / sent state.
+
+    date_from / date_to are inclusive 'YYYY-MM-DD' strings compared against the
+    date portion of start_time (ISO-8601 text sorts lexically). limit caps the
+    number of rows; unsent_only excludes jobs already marked sent.
+    """
+    db_path = db_path or _DEFAULT_DB
+    if not db_path.exists():
+        return []
+    clauses = []
+    params: list = []
+    if date_from:
+        clauses.append("substr(start_time, 1, 10) >= ?")
+        params.append(date_from)
+    if date_to:
+        clauses.append("substr(start_time, 1, 10) <= ?")
+        params.append(date_to)
+    if unsent_only:
+        clauses.append("sent_at IS NULL")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    sql = "SELECT * FROM jobs %s ORDER BY start_time DESC" % where
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    conn = _connect(db_path)
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def monthly_summary(date_from: Optional[str] = None,
+                    date_to: Optional[str] = None,
+                    db_path: Optional[Path] = None) -> list[dict]:
+    """Compute monthly ink usage per user over an optional date range.
+
+    Same aggregation as rebuild_monthly_summary() but filtered by job date range
+    and returned directly without touching the persisted monthly_ink_usage table.
+    """
+    db_path = db_path or _DEFAULT_DB
+    if not db_path.exists():
+        return []
+    ink_ch = ["PK", "MK", "C", "VM", "Y", "OR", "GR", "LC", "VLM", "LK", "LLK", "V"]
+    sum_cols = ", ".join("SUM(InkUse_%s) AS InkUse_%s" % (ch, ch) for ch in ink_ch)
+    total_expr = " + ".join("COALESCE(SUM(InkUse_%s), 0)" % ch for ch in ink_ch)
+    clauses = [
+        "username IS NOT NULL", "username != ''",
+        "start_time IS NOT NULL", "InkUse_PK IS NOT NULL",
+    ]
+    params: list = []
+    if date_from:
+        clauses.append("substr(start_time, 1, 10) >= ?")
+        params.append(date_from)
+    if date_to:
+        clauses.append("substr(start_time, 1, 10) <= ?")
+        params.append(date_to)
+    sql = """
+        SELECT
+            username,
+            substr(start_time, 1, 7) AS month,
+            COUNT(*) AS job_count,
+            %s,
+            (%s) / 100.0 AS InkUse_total_ml
+        FROM jobs
+        WHERE %s
+        GROUP BY username, substr(start_time, 1, 7)
+        ORDER BY month, username
+    """ % (sum_cols, total_expr, " AND ".join(clauses))
+    conn = _connect(db_path)
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def mark_sent(job_ids: list[str], db_path: Optional[Path] = None) -> int:
+    """Stamp sent_at = now for the given job_ids. Returns rows updated."""
+    db_path = db_path or _DEFAULT_DB
+    if not job_ids:
+        return 0
+    conn = _connect(db_path)
+    updated = 0
+    with conn:
+        for jid in job_ids:
+            cur = conn.execute(
+                "UPDATE jobs SET sent_at = datetime('now') WHERE job_id = ?", (jid,))
+            updated += cur.rowcount
+    conn.close()
+    return updated
