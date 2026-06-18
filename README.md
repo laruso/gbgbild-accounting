@@ -252,6 +252,7 @@ the defaults.
 | Command | What it does |
 |---|---|
 | `pull` | SNMP-pull the job log + ji: detail buffer from the printer, decrypt ink blobs, upsert into SQLite |
+| `recover` | Re-decrypt ink from blobs already stored in the DB, without contacting the printer. Resolves the serial offline-first (`--serial`/`LFP_PRINTER_SERIAL` → cached → live fetch). Use to backfill ink lost when earlier pulls had no serial |
 | `status` | Show current ink tank levels |
 | `list [--limit N] [--from D] [--to D]` | Show recent jobs from the local DB, newest first, with a leading `#` index. `--from`/`--to` are inclusive `YYYY-MM-DD` filters |
 | `export [file]` | Write all jobs to CSV (default `jobs.csv`) |

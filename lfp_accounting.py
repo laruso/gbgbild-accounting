@@ -4,6 +4,7 @@ Epson SC-P9500 accounting tool — SNMP-based replacement for LFP Accounting Too
 
 Usage:
   python3 lfp_accounting.py --printer <ip> pull
+  python3 lfp_accounting.py recover
   python3 lfp_accounting.py --printer <ip> status
   python3 lfp_accounting.py list [--limit 20] [--from YYYY-MM-DD] [--to YYYY-MM-DD]
   python3 lfp_accounting.py summary [--from YYYY-MM-DD] [--to YYYY-MM-DD]
@@ -97,6 +98,41 @@ def cmd_pull(args):
             print("  Newest: %s  '%s'" % (newest.start_time.strftime("%Y-%m-%d %H:%M"), newest.job_name[:50]))
         if oldest:
             print("  Oldest: %s  '%s'" % (oldest.start_time.strftime("%Y-%m-%d %H:%M"), oldest.job_name[:50]))
+
+
+def cmd_recover(args):
+    """Re-decrypt stored ji: blobs into ink without touching the printer.
+
+    Useful when earlier pulls saved blobs but had no serial. Resolves the
+    serial offline-first (override -> cached) and only falls back to a live
+    fetch if nothing is configured or cached.
+    """
+    serial = (args.serial or os.environ.get("LFP_PRINTER_SERIAL") or "").strip()
+    if serial:
+        set_meta("printer_serial", serial)
+        print("Using configured printer serial: %s" % serial)
+    else:
+        serial = get_meta("printer_serial")
+        if serial:
+            print("Using cached printer serial: %s" % serial)
+        else:
+            print("No serial configured or cached — attempting live fetch from %s..."
+                  % args.printer)
+            serial = fetch_serial_number(args.printer, community="epson")
+            if serial:
+                set_meta("printer_serial", serial)
+                print("Printer serial: %s" % serial)
+
+    if not serial:
+        print("Could not determine a serial number — nothing to recover. "
+              "Set --serial or LFP_PRINTER_SERIAL.")
+        sys.exit(1)
+
+    recovered = redecrypt_stored_blobs(serial)
+    if recovered:
+        print("Recovered ink for %d job(s) from stored blobs." % recovered)
+    else:
+        print("No jobs needed recovery (every stored blob already has ink).")
 
 
 def cmd_status(args):
@@ -318,6 +354,7 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("pull",    help="Fetch job log from printer and store in DB")
+    sub.add_parser("recover", help="Re-decrypt stored ink blobs (no printer pull)")
     sub.add_parser("status",  help="Show current ink levels")
 
     p_summary = sub.add_parser("summary", help="Show monthly ink usage per user")
@@ -369,6 +406,8 @@ def main():
 
     if args.command == "pull":
         cmd_pull(args)
+    elif args.command == "recover":
+        cmd_recover(args)
     elif args.command == "status":
         cmd_status(args)
     elif args.command == "list":
