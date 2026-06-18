@@ -17,6 +17,7 @@ Sending requires the Bearer token in the environment (never committed):
 """
 import argparse
 import csv
+import os
 import sys
 import logging
 from datetime import date, timedelta
@@ -24,19 +25,50 @@ from pathlib import Path
 
 from joblog import fetch_job_log, fetch_ink_status, fetch_serial_number, STATUS_CODE, INK_CHANNELS
 from store  import (upsert_jobs, all_jobs, rebuild_monthly_summary, get_monthly_summary,
-                    query_jobs, monthly_summary, mark_sent)
+                    query_jobs, monthly_summary, mark_sent,
+                    get_meta, set_meta, redecrypt_stored_blobs)
 import senders
+
+
+def _resolve_serial(args):
+    """Resolve the printer serial used for ink decryption.
+
+    The serial is a fixed hardware property, so once it is known it is cached
+    and reused — ink decryption must not be at the mercy of the flaky live BDC
+    fetch failing on a given pull. Priority:
+      1. explicit override (--serial or LFP_PRINTER_SERIAL)
+      2. live SNMP fetch (cached on success)
+      3. last-known-good cached value
+    """
+    override = args.serial or os.environ.get("LFP_PRINTER_SERIAL")
+    if override:
+        override = override.strip()
+        set_meta("printer_serial", override)
+        print("Using configured printer serial: %s (ink decryption enabled)" % override)
+        return override
+
+    serial = fetch_serial_number(args.printer, community="epson")
+    if serial:
+        set_meta("printer_serial", serial)
+        print("Printer serial: %s (ink decryption enabled)" % serial)
+        return serial
+
+    cached = get_meta("printer_serial")
+    if cached:
+        print("WARNING: live serial fetch failed — using last-known serial %s "
+              "(ink decryption still enabled)" % cached)
+        return cached
+
+    print("WARNING: Could not get serial number and none is cached — "
+          "ink values will be unavailable. Set LFP_PRINTER_SERIAL to fix this.")
+    return None
 
 
 def cmd_pull(args):
     print("Connecting to %s via SNMP..." % args.printer)
 
-    # Fetch serial number for ink decryption
-    serial = fetch_serial_number(args.printer, community="epson")
-    if serial:
-        print("Printer serial: %s (ink decryption enabled)" % serial)
-    else:
-        print("WARNING: Could not get serial number — ink values will be unavailable")
+    # Resolve serial for ink decryption (override > live fetch > cached).
+    serial = _resolve_serial(args)
 
     print("Fetching up to 499 job records (may take 2-4 minutes)...")
     records = fetch_job_log(args.printer, community=args.community, serial=serial or "")
@@ -46,9 +78,15 @@ def cmd_pull(args):
 
     ink_count = sum(1 for r in records if r.ink_use)
     inserted, updated = upsert_jobs(records)
+
+    # Recover ink for any jobs whose blob was stored earlier without a serial.
+    recovered = redecrypt_stored_blobs(serial) if serial else 0
+
     print("Done.")
     print("  %d new jobs stored" % inserted)
     print("  %d existing jobs updated with ink/user data" % updated)
+    if recovered:
+        print("  %d earlier job(s) recovered ink from stored blobs" % recovered)
     print("  %d total jobs retrieved from printer" % len(records))
     print("  %d jobs with ink usage data" % ink_count)
 
@@ -267,10 +305,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Epson SC-P9500 accounting tool"
     )
-    parser.add_argument("--printer",   default="192.168.1.107",
-                        help="Printer IP address (default: 192.168.1.107)")
+    parser.add_argument("--printer",   default="192.168.1.55",
+                        help="Printer IP address (default: 192.168.1.55)")
     parser.add_argument("--community", default="public",
                         help="SNMP community string (default: public)")
+    parser.add_argument("--serial", default=None,
+                        help="Printer serial for ink decryption. Overrides the "
+                             "live fetch and cached value (or set LFP_PRINTER_SERIAL).")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show debug logging")
 

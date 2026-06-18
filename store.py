@@ -4,7 +4,7 @@ SQLite storage for Epson SC-P9500 job log records.
 import sqlite3
 from pathlib import Path
 from typing import Optional
-from joblog import JobRecord
+from joblog import JobRecord, decode_ji_ink, INK_CHANNELS
 
 _DEFAULT_DB = Path.home() / ".lfp_accounting" / "jobs.db"
 
@@ -84,7 +84,72 @@ def _ensure_schema(conn: sqlite3.Connection):
             PRIMARY KEY (username, month)
         )
     """)
+    # Small key/value store for persistent settings. Used to cache the printer
+    # serial number (a fixed hardware constant) so ink decryption no longer
+    # depends on the flaky live BDC fetch succeeding on every single pull.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     conn.commit()
+
+
+def get_meta(key: str, db_path: Optional[Path] = None) -> Optional[str]:
+    """Return a persisted meta value, or None if unset."""
+    db_path = db_path or _DEFAULT_DB
+    if not db_path.exists():
+        return None
+    conn = _connect(db_path)
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else None
+
+
+def set_meta(key: str, value: str, db_path: Optional[Path] = None) -> None:
+    """Persist a meta value, overwriting any previous one."""
+    db_path = db_path or _DEFAULT_DB
+    conn = _connect(db_path)
+    with conn:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value))
+    conn.close()
+
+
+def redecrypt_stored_blobs(serial: str, db_path: Optional[Path] = None) -> int:
+    """Decrypt ink for jobs that have a stored ji_blob but no ink yet.
+
+    Recovers ink that was lost when the serial number was unavailable at pull
+    time: the raw 208-byte blob is always stored, so once a valid serial is
+    known we can decrypt it after the fact. Returns the number of jobs updated.
+    """
+    if not serial:
+        return 0
+    db_path = db_path or _DEFAULT_DB
+    if not db_path.exists():
+        return 0
+    set_cols = ", ".join("InkUse_%s = ?" % ch for ch in INK_CHANNELS)
+    conn = _connect(db_path)
+    rows = conn.execute(
+        "SELECT job_id, ji_blob FROM jobs "
+        "WHERE ji_blob IS NOT NULL AND InkUse_PK IS NULL"
+    ).fetchall()
+    updated = 0
+    with conn:
+        for row in rows:
+            ink = decode_ji_ink(row["ji_blob"], serial)
+            if not ink:
+                continue
+            vals = [ink.get(ch) for ch in INK_CHANNELS]
+            conn.execute(
+                "UPDATE jobs SET %s WHERE job_id = ?" % set_cols,
+                (*vals, row["job_id"]))
+            updated += 1
+    conn.close()
+    return updated
 
 
 def _job_id(rec: JobRecord) -> str:

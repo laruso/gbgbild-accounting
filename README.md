@@ -57,7 +57,7 @@ python lfp_accounting.py send-batch --from 2026-05-01 --to 2026-05-31
 python lfp_accounting.py help
 ```
 
-The default printer IP is `192.168.1.107`. Override with `--printer`:
+The default printer IP is `192.168.1.55`. Override with `--printer`:
 
 ```bash
 python lfp_accounting.py --printer 192.168.1.50 pull
@@ -304,8 +304,16 @@ job already marked sent, so re-running it is safe and won't double-bill. Pass
 The printer encrypts per-job ink usage in a 208-byte blob returned by an
 Epson-proprietary SNMP command (`ji:`). The cipher is a custom 3-round
 Feistel with 8-byte blocks and CBC-style chaining, keyed by the printer's
-serial number. The serial is fetched automatically over SNMP at the start of
-each `pull`.
+serial number.
+
+The serial is a fixed hardware constant, so `pull` resolves it in this order:
+an explicit override (`--serial` or the `LFP_PRINTER_SERIAL` env var), then a
+live SNMP fetch (cached in the DB on success), then the last-known cached
+value. The live fetch is unreliable, so **pin the serial via
+`LFP_PRINTER_SERIAL`** (see `deploy/crontab.example`) to guarantee ink
+decryption regardless of whether the fetch succeeds. The raw blob is always
+stored, so each `pull` also re-decrypts any earlier jobs that were saved
+without ink once a serial is available.
 
 The decryption logic lives in `joblog.py` (`_decrypt_ji_blob`,
 `_parse_ink_from_tlv`, `decode_ji_ink`). The reverse-engineering process —
