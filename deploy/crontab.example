@@ -9,11 +9,9 @@
 # pull.log is gitignored and grows over time; to cap it, rotate with logrotate
 # or periodically truncate (e.g. a weekly `: > pull.log` cron entry).
 #
-# IMPORTANT: the printer serial is required to decrypt per-job ink usage, and
-# the live SNMP fetch of it is unreliable. Pin it with LFP_PRINTER_SERIAL (or
-# --serial) so ink decryption never depends on that fetch succeeding. The
-# serial is a fixed hardware constant — find it in the printer's web UI / on
-# its label. (Once any pull resolves the serial it is also cached in the DB,
-# so a missed fetch falls back to the last-known value automatically.)
+# The printer serial (needed to decrypt per-job ink) is hardcoded in
+# lfp_accounting.py (DEFAULT_PRINTER_SERIAL), so nothing extra is needed here.
+# Only if the printer is ever replaced, prepend LFP_PRINTER_SERIAL=<new-serial>
+# to override it.
 
-*/15 * * * * cd /home/gbgbild/gbgbild-accounting && LFP_PRINTER_SERIAL=X6FB001980 /usr/bin/python3 lfp_accounting.py --printer 192.168.1.55 pull >> /home/gbgbild/gbgbild-accounting/pull.log 2>&1
+*/15 * * * * cd /home/gbgbild/gbgbild-accounting && /usr/bin/python3 lfp_accounting.py --printer 192.168.1.55 pull >> /home/gbgbild/gbgbild-accounting/pull.log 2>&1

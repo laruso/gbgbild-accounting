@@ -252,7 +252,7 @@ the defaults.
 | Command | What it does |
 |---|---|
 | `pull` | SNMP-pull the job log + ji: detail buffer from the printer, decrypt ink blobs, upsert into SQLite |
-| `recover` | Re-decrypt ink from blobs already stored in the DB, without contacting the printer. Resolves the serial offline-first (`--serial`/`LFP_PRINTER_SERIAL` → cached → live fetch). Use to backfill ink lost when earlier pulls had no serial |
+| `recover` | Re-decrypt ink from blobs already stored in the DB, without contacting the printer. Uses the hardcoded serial (override with `--serial`/`LFP_PRINTER_SERIAL`). Use to backfill ink for blobs stored but not yet decrypted |
 | `status` | Show current ink tank levels |
 | `list [--limit N] [--from D] [--to D]` | Show recent jobs from the local DB, newest first, with a leading `#` index. `--from`/`--to` are inclusive `YYYY-MM-DD` filters |
 | `export [file]` | Write all jobs to CSV (default `jobs.csv`) |
@@ -307,14 +307,12 @@ Epson-proprietary SNMP command (`ji:`). The cipher is a custom 3-round
 Feistel with 8-byte blocks and CBC-style chaining, keyed by the printer's
 serial number.
 
-The serial is a fixed hardware constant, so `pull` resolves it in this order:
-an explicit override (`--serial` or the `LFP_PRINTER_SERIAL` env var), then a
-live SNMP fetch (cached in the DB on success), then the last-known cached
-value. The live fetch is unreliable, so **pin the serial via
-`LFP_PRINTER_SERIAL`** (see `deploy/crontab.example`) to guarantee ink
-decryption regardless of whether the fetch succeeds. The raw blob is always
-stored, so each `pull` also re-decrypts any earlier jobs that were saved
-without ink once a serial is available.
+The serial is a fixed hardware constant, so it is **hardcoded** as
+`DEFAULT_PRINTER_SERIAL` in `lfp_accounting.py` — no fetching or configuration
+needed. If the printer is ever replaced, override it with `--serial` or the
+`LFP_PRINTER_SERIAL` env var. The raw blob is always stored, so each `pull`
+also re-decrypts any earlier jobs that were saved without ink (and `recover`
+does the same on demand, without touching the printer).
 
 The decryption logic lives in `joblog.py` (`_decrypt_ji_blob`,
 `_parse_ink_from_tlv`, `decode_ji_ink`). The reverse-engineering process —

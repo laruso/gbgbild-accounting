@@ -24,45 +24,30 @@ import logging
 from datetime import date, timedelta
 from pathlib import Path
 
-from joblog import fetch_job_log, fetch_ink_status, fetch_serial_number, STATUS_CODE, INK_CHANNELS
+from joblog import fetch_job_log, fetch_ink_status, STATUS_CODE, INK_CHANNELS
 from store  import (upsert_jobs, all_jobs, rebuild_monthly_summary, get_monthly_summary,
                     query_jobs, monthly_summary, mark_sent,
-                    get_meta, set_meta, redecrypt_stored_blobs)
+                    set_meta, redecrypt_stored_blobs)
 import senders
+
+
+# The shop's Epson SC-P9500 serial. It is a fixed hardware constant and the key
+# used to decrypt per-job ink, so it is hardcoded — no need to fetch or pass it.
+# Override with --serial / LFP_PRINTER_SERIAL only if the printer is replaced.
+DEFAULT_PRINTER_SERIAL = "X6FB001980"
 
 
 def _resolve_serial(args):
     """Resolve the printer serial used for ink decryption.
 
-    The serial is a fixed hardware property, so once it is known it is cached
-    and reused — ink decryption must not be at the mercy of the flaky live BDC
-    fetch failing on a given pull. Priority:
-      1. explicit override (--serial or LFP_PRINTER_SERIAL)
-      2. live SNMP fetch (cached on success)
-      3. last-known-good cached value
+    Defaults to the hardcoded DEFAULT_PRINTER_SERIAL; --serial or
+    LFP_PRINTER_SERIAL override it if the printer is ever swapped.
     """
-    override = args.serial or os.environ.get("LFP_PRINTER_SERIAL")
-    if override:
-        override = override.strip()
-        set_meta("printer_serial", override)
-        print("Using configured printer serial: %s (ink decryption enabled)" % override)
-        return override
-
-    serial = fetch_serial_number(args.printer, community="epson")
-    if serial:
-        set_meta("printer_serial", serial)
-        print("Printer serial: %s (ink decryption enabled)" % serial)
-        return serial
-
-    cached = get_meta("printer_serial")
-    if cached:
-        print("WARNING: live serial fetch failed — using last-known serial %s "
-              "(ink decryption still enabled)" % cached)
-        return cached
-
-    print("WARNING: Could not get serial number and none is cached — "
-          "ink values will be unavailable. Set LFP_PRINTER_SERIAL to fix this.")
-    return None
+    serial = (args.serial or os.environ.get("LFP_PRINTER_SERIAL")
+              or DEFAULT_PRINTER_SERIAL).strip()
+    set_meta("printer_serial", serial)
+    print("Printer serial: %s (ink decryption enabled)" % serial)
+    return serial
 
 
 def cmd_pull(args):
@@ -103,30 +88,12 @@ def cmd_pull(args):
 def cmd_recover(args):
     """Re-decrypt stored ji: blobs into ink without touching the printer.
 
-    Useful when earlier pulls saved blobs but had no serial. Resolves the
-    serial offline-first (override -> cached) and only falls back to a live
-    fetch if nothing is configured or cached.
+    Useful when earlier pulls saved blobs but couldn't decrypt them. Uses the
+    hardcoded serial (or --serial / LFP_PRINTER_SERIAL override).
     """
-    serial = (args.serial or os.environ.get("LFP_PRINTER_SERIAL") or "").strip()
-    if serial:
-        set_meta("printer_serial", serial)
-        print("Using configured printer serial: %s" % serial)
-    else:
-        serial = get_meta("printer_serial")
-        if serial:
-            print("Using cached printer serial: %s" % serial)
-        else:
-            print("No serial configured or cached — attempting live fetch from %s..."
-                  % args.printer)
-            serial = fetch_serial_number(args.printer, community="epson")
-            if serial:
-                set_meta("printer_serial", serial)
-                print("Printer serial: %s" % serial)
-
-    if not serial:
-        print("Could not determine a serial number — nothing to recover. "
-              "Set --serial or LFP_PRINTER_SERIAL.")
-        sys.exit(1)
+    serial = (args.serial or os.environ.get("LFP_PRINTER_SERIAL")
+              or DEFAULT_PRINTER_SERIAL).strip()
+    print("Using printer serial: %s" % serial)
 
     recovered = redecrypt_stored_blobs(serial)
     if recovered:
