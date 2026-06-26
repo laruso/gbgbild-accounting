@@ -463,6 +463,79 @@ def fetch_serial_number(host: str, community: str = "epson",
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Matching ji: entries to job-log rows
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _align_ji_to_rows(ji_meta: dict, counters: dict, names: dict) -> dict:
+    """Map each job-log row index to its ji: metadata entry, by recency.
+
+    The job log and the ji: buffer both list jobs newest-first, so they line up
+    by position: the newest job-log row corresponds to ji index 0, the next to
+    index 1, and so on. This is far more reliable than matching by job name —
+    roughly half the ji: entries carry no job name at all (only a blob), and the
+    job-log name format differs from the ji: name, so name matching silently
+    drops most blobs (and with them all ink + username data).
+
+    The printer mirrors the whole buffer at index >= 256; those duplicates are
+    ignored. The alignment offset is auto-detected and verified against the ji:
+    entries that *do* carry a job name; if that verification is weak we fall
+    back to name-prefix matching so a blob is never attributed to the wrong job.
+
+    Returns {row_index: ji_meta_entry}.
+    """
+    # Recency order: newest job-log row first (highest counter first).
+    rows = sorted(counters, key=lambda i: counters.get(i, 0), reverse=True)
+    # Recency order for ji: index 0 = newest. Skip the mirror block at >= 256.
+    ji_list = [ji_meta[i] for i in sorted(ji_meta) if i < 256]
+    if not rows or not ji_list:
+        return {}
+
+    def named_matches(offset: int) -> int:
+        hits = 0
+        for pos, m in enumerate(ji_list):
+            jn = (m.get("job_name") or "").strip()
+            if not jn:
+                continue
+            r = pos + offset
+            if 0 <= r < len(rows):
+                nm = names.get(rows[r], "")
+                if nm and nm[:20] == jn[:20]:
+                    hits += 1
+        return hits
+
+    named = sum(1 for m in ji_list if (m.get("job_name") or "").strip())
+    best_offset, best_hits = 0, -1
+    for off in (0, -1, 1, -2, 2):
+        h = named_matches(off)
+        if h > best_hits:
+            best_offset, best_hits = off, h
+
+    row_meta: dict = {}
+    if named == 0 or best_hits >= max(2, (named + 1) // 2):
+        # Trust positional alignment — this also captures the blob-only
+        # (blank job_name) entries that name matching can never reach.
+        log.info("ji: matched by position (offset %d, %d/%d named entries verified)",
+                 best_offset, best_hits, named)
+        for pos, m in enumerate(ji_list):
+            r = pos + best_offset
+            if 0 <= r < len(rows):
+                row_meta[rows[r]] = m
+    else:
+        # Alignment looks unreliable — fall back to name matching only.
+        log.warning("ji: positional alignment weak (%d/%d verified); "
+                    "falling back to name matching", best_hits, named)
+        for idx, nm in names.items():
+            if not nm:
+                continue
+            for m in ji_list:
+                jn = (m.get("job_name") or "").strip()
+                if jn and nm[:20] == jn[:20]:
+                    row_meta[idx] = m
+                    break
+    return row_meta
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -551,6 +624,9 @@ def fetch_job_log(host: str, community: str = "public",
     except Exception as e:
         log.warning("Could not fetch ji: metadata: %s", e)
 
+    # Join ji: entries to job-log rows by recency position (see _align_ji_to_rows).
+    row_meta = _align_ji_to_rows(ji_meta, counters, names)
+
     for idx in all_rows:
         name = names.get(idx, "")
         if not name:
@@ -569,17 +645,10 @@ def fetch_job_log(host: str, community: str = "public",
         pcode = psrc_codes.get(idx, 0)
         psrc  = PAPER_SOURCE.get(pcode, str(pcode))
 
-        # Find matching ji: entry by job name prefix
-        username = ""
-        machine_name = ""
-        ji_blob = None
-        for ji_idx, meta in ji_meta.items():
-            ji_jobname = meta.get("job_name", "")
-            if ji_jobname and name[:20] == ji_jobname[:20]:
-                username = meta.get("username", "")
-                machine_name = meta.get("machine", "")
-                ji_blob = meta.get("ji_blob")
-                break
+        meta = row_meta.get(idx)
+        username     = (meta.get("username") if meta else "") or ""
+        machine_name = (meta.get("machine")  if meta else "") or ""
+        ji_blob      = meta.get("ji_blob") if meta else None
 
         # Decrypt ink usage from ji: blob if serial number available
         ink_use = None
@@ -682,8 +751,15 @@ def fetch_ji_metadata(host: str, community: str = "epson",
     """
     log.info("Fetching ji: metadata from %s via BDC/SNMP...", host)
     results = {}
+    last_hit = -1   # highest index that yielded a real ji: entry
 
     for job_idx in range(max_jobs):
+        # The live buffer is a contiguous block at low indices (the printer
+        # mirrors it again at index >= 256, which we don't need). Once we are
+        # well past the last real entry, stop rather than scan to max_jobs.
+        if last_hit >= 0 and job_idx - last_hit > 48:
+            break
+
         oid = f"{_JI_OID_PREFIX}.{job_idx}"
         resp = _snmp_send(host, _snmp_pkt(0xa0, community, oid), timeout)
         if not resp:
@@ -721,6 +797,7 @@ def fetch_ji_metadata(host: str, community: str = "epson",
 
         if meta["username"] or meta["machine"] or meta.get("ji_blob"):
             results[job_idx] = meta
+            last_hit = job_idx
             log.debug("  ji[%d]: user=%s machine=%s", job_idx, meta["username"], meta["machine"])
 
     log.info("  Got ji: metadata for %d jobs", len(results))
