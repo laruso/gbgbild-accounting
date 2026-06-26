@@ -692,7 +692,14 @@ def _parse_ji_suffix(data: bytes) -> dict:
     Parse the TLV suffix from a ji: BDC response.
 
     Format after the 208-byte binary blob:
-      [header_byte] 0x00 [tag length data]...
+      [len_prefix] 0x00 [tag length data]...
+
+    The first byte is a one-byte length prefix (= len(data) - 4) whose value
+    varies with the suffix length — long suffixes land in the uppercase-ASCII
+    range (B/D/E…), short ones don't (0x33, 0x3e, 0x40…). The real TLV stream
+    starts at the first 0x00, so we skip a single non-zero lead byte rather
+    than only skipping when it looks like a letter (which dropped the username
+    and job name for every short suffix).
 
     Tags:
       0x00 + subtype 0x07 + len + username
@@ -705,9 +712,8 @@ def _parse_ji_suffix(data: bytes) -> dict:
         return result
 
     i = 0
-    # Skip header byte (observed: B=0x42, E=0x45, F=0x46, G=0x47)
-    # Accept any uppercase ASCII letter to be future-proof.
-    if 0x41 <= data[i] <= 0x5A:
+    # Skip the leading length-prefix byte (TLV proper begins at the first 0x00).
+    if data[0] != 0x00:
         i += 1
 
     while i < len(data) - 1:
