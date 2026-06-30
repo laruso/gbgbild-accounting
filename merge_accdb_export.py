@@ -83,7 +83,11 @@ def main():
             lookup[k] = r
 
     # --- 1. Fill missing ink/user on existing jobs (within the date range) ---
-    clauses = ["InkUse_PK IS NULL"]
+    # "Missing" means no ink at all (NULL) OR an all-zero total — the latter are
+    # entries the printer hadn't populated when we pulled, which the .accdb has
+    # the real value for. The update SETs ink directly, so zeros get overwritten.
+    ink_total = "(" + " + ".join("COALESCE(InkUse_%s, 0)" % ch for ch in INK_CHANNELS) + ")"
+    clauses = [f"(InkUse_PK IS NULL OR {ink_total} = 0)"]
     params: list = []
     if args.date_from:
         clauses.append("substr(start_time, 1, 10) >= ?")

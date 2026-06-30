@@ -407,14 +407,24 @@ def decode_ji_ink(blob: bytes, serial: str) -> Optional[dict]:
         serial: Printer serial number (e.g. 'X6FB001980')
 
     Returns:
-        Dict mapping channel name to usage value, or None on failure.
-        E.g. {'PK': 1, 'MK': 36, 'C': 7, ...}
+        Dict mapping channel name to usage value, or None on failure or when
+        the blob carries no usage yet. E.g. {'PK': 1, 'MK': 36, 'C': 7, ...}
+
+    An all-zero result is treated as "no data" (returns None): a real print
+    always lays down some ink, so all twelve channels reading zero means the
+    printer hasn't populated this entry yet (the ji: buffer fills in slightly
+    after the print) or it's a placeholder entry. Returning None keeps the job
+    NULL/backfillable instead of locking in a 0 that a later pull or the .accdb
+    backfill can never replace.
     """
     if not blob or len(blob) != 208 or not serial:
         return None
     try:
         decrypted = _decrypt_ji_blob(blob, serial)
-        return _parse_ink_from_tlv(decrypted) or None
+        ink = _parse_ink_from_tlv(decrypted)
+        if not ink or not any(ink.values()):
+            return None
+        return ink
     except Exception as e:
         log.debug("Blob decryption failed: %s", e)
         return None
