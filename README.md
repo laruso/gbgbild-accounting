@@ -247,6 +247,34 @@ This:
 Edit `ACCDB_PATH` and `ACCDB_PWD` in the script if your install differs from
 the defaults.
 
+### Backfilling when the `.accdb` and the live DB are on different machines
+
+`backfill_from_accdb.py` assumes the `.accdb` and `jobs.db` live on the *same*
+box. In the normal deployment they don't: the `.accdb` is on the Windows PC and
+the live `jobs.db` is on the Pi. The printer's detailed buffer only holds ~30
+jobs, so any stretch where the Pi wasn't capturing ink/user leaves gaps that
+only the `.accdb` still has. Backfill those in two steps — **without** copying
+the Pi's database to the PC and back (the Pi keeps pulling, so a copy-back would
+clobber freshly captured jobs):
+
+```bash
+# 1. On the Windows PC (has the .accdb + Access ODBC driver):
+pip install pyodbc
+python export_accdb.py                 # writes accdb_export.db (read-only export)
+
+# 2. Copy the export to the Pi:
+scp accdb_export.db gbgbild@<pi-ip>:~/gbgbild-accounting/
+
+# 3. On the Pi, merge it into the live DB:
+python3 merge_accdb_export.py accdb_export.db
+```
+
+`merge_accdb_export.py` fills missing user/ink on existing jobs and inserts jobs
+the Pi never saw, **never overwriting data already present**, and is safe to run
+more than once. ⚠️ Merged jobs come in with `sent_at` unset, so `send-batch`
+will treat them as billable — if those months were already invoiced through the
+old tool, scope your sends by date range to avoid double-billing.
+
 ## Commands reference
 
 | Command | What it does |
