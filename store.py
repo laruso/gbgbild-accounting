@@ -175,28 +175,30 @@ def upsert_jobs(records: list[JobRecord],
              ji_blob)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """
-    # Fill any field that is currently missing, without overwriting good data:
-    # COALESCE keeps the existing value when set and only falls back to the new
-    # one when null/empty. The WHERE fires when we can actually add something —
-    # new ink for an ink-less job, OR a username for one still missing it (a job
-    # may have been stored with ink but a blank username before the ji: parser
-    # could read it; that must still be backfillable even though it has ink).
-    update_sql = """
+    ink_ch = ["PK", "MK", "C", "VM", "Y", "OR", "GR", "LC", "VLM", "LK", "LLK", "V"]
+    # Fill (or repair) a job's data without ever clobbering a real value:
+    #  - username/machine: fill only when currently blank.
+    #  - ink: replace when the existing total is 0 (NULL, or an all-zero row we
+    #    stored before the printer had populated the blob — a real print always
+    #    uses ink, so a stored 0 is "not captured yet"); keep it once it's real.
+    #    The printer keeps the real ink in its buffer for a while, so a later
+    #    pull repairs these stuck zeros directly — no .accdb needed.
+    # The WHERE fires only when there is genuinely something to add: new ink for
+    # an ink-less/zero job, or a username for one still missing it.
+    ink_total = "(" + " + ".join("COALESCE(InkUse_%s, 0)" % ch for ch in ink_ch) + ")"
+    ink_set = ", ".join(
+        "InkUse_{c} = CASE WHEN {t} = 0 THEN COALESCE(?, InkUse_{c}) "
+        "ELSE InkUse_{c} END".format(c=ch, t=ink_total) for ch in ink_ch)
+    update_sql = f"""
         UPDATE jobs SET
             username     = COALESCE(NULLIF(username, ''), ?),
             machine_name = COALESCE(NULLIF(machine_name, ''), ?),
-            InkUse_PK  = COALESCE(InkUse_PK,  ?), InkUse_MK  = COALESCE(InkUse_MK,  ?),
-            InkUse_C   = COALESCE(InkUse_C,   ?), InkUse_VM  = COALESCE(InkUse_VM,  ?),
-            InkUse_Y   = COALESCE(InkUse_Y,   ?), InkUse_OR  = COALESCE(InkUse_OR,  ?),
-            InkUse_GR  = COALESCE(InkUse_GR,  ?), InkUse_LC  = COALESCE(InkUse_LC,  ?),
-            InkUse_VLM = COALESCE(InkUse_VLM, ?), InkUse_LK  = COALESCE(InkUse_LK,  ?),
-            InkUse_LLK = COALESCE(InkUse_LLK, ?), InkUse_V   = COALESCE(InkUse_V,   ?),
-            ji_blob    = COALESCE(ji_blob, ?)
+            {ink_set},
+            ji_blob      = COALESCE(ji_blob, ?)
         WHERE job_id = ?
-          AND ( (InkUse_PK IS NULL AND ? IS NOT NULL)
+          AND ( ({ink_total} = 0 AND ? IS NOT NULL)
                 OR ((username IS NULL OR username = '') AND ? IS NOT NULL) )
     """
-    ink_ch = ["PK", "MK", "C", "VM", "Y", "OR", "GR", "LC", "VLM", "LK", "LLK", "V"]
     inserted = updated = 0
     with conn:
         for rec in records:
