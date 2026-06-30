@@ -175,14 +175,26 @@ def upsert_jobs(records: list[JobRecord],
              ji_blob)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """
+    # Fill any field that is currently missing, without overwriting good data:
+    # COALESCE keeps the existing value when set and only falls back to the new
+    # one when null/empty. The WHERE fires when we can actually add something —
+    # new ink for an ink-less job, OR a username for one still missing it (a job
+    # may have been stored with ink but a blank username before the ji: parser
+    # could read it; that must still be backfillable even though it has ink).
     update_sql = """
         UPDATE jobs SET
-            username = ?, machine_name = ?,
-            InkUse_PK = ?, InkUse_MK = ?, InkUse_C = ?, InkUse_VM = ?,
-            InkUse_Y = ?, InkUse_OR = ?, InkUse_GR = ?, InkUse_LC = ?,
-            InkUse_VLM = ?, InkUse_LK = ?, InkUse_LLK = ?, InkUse_V = ?,
-            ji_blob = ?
-        WHERE job_id = ? AND InkUse_PK IS NULL
+            username     = COALESCE(NULLIF(username, ''), ?),
+            machine_name = COALESCE(NULLIF(machine_name, ''), ?),
+            InkUse_PK  = COALESCE(InkUse_PK,  ?), InkUse_MK  = COALESCE(InkUse_MK,  ?),
+            InkUse_C   = COALESCE(InkUse_C,   ?), InkUse_VM  = COALESCE(InkUse_VM,  ?),
+            InkUse_Y   = COALESCE(InkUse_Y,   ?), InkUse_OR  = COALESCE(InkUse_OR,  ?),
+            InkUse_GR  = COALESCE(InkUse_GR,  ?), InkUse_LC  = COALESCE(InkUse_LC,  ?),
+            InkUse_VLM = COALESCE(InkUse_VLM, ?), InkUse_LK  = COALESCE(InkUse_LK,  ?),
+            InkUse_LLK = COALESCE(InkUse_LLK, ?), InkUse_V   = COALESCE(InkUse_V,   ?),
+            ji_blob    = COALESCE(ji_blob, ?)
+        WHERE job_id = ?
+          AND ( (InkUse_PK IS NULL AND ? IS NOT NULL)
+                OR ((username IS NULL OR username = '') AND ? IS NOT NULL) )
     """
     ink_ch = ["PK", "MK", "C", "VM", "Y", "OR", "GR", "LC", "VLM", "LK", "LLK", "V"]
     inserted = updated = 0
@@ -217,6 +229,8 @@ def upsert_jobs(records: list[JobRecord],
                     *ink_vals,
                     rec.ji_blob,
                     jid,
+                    ink_vals[0],            # new InkUse_PK — guards the ink fill
+                    rec.username or None,   # new username — guards the user fill
                 ))
                 if cur.rowcount > 0:
                     updated += 1
