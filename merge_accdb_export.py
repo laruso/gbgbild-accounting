@@ -9,8 +9,14 @@ jobs.db on the Pi.
   - Never overwrites data we already have, and is safe to run more than once.
 
 Usage (on the Pi):
-    python3 merge_accdb_export.py [accdb_export.db]    # default: accdb_export.db
+    python3 merge_accdb_export.py [accdb_export.db]
+    python3 merge_accdb_export.py --from 2026-06-01 --to 2026-06-30
+    python3 merge_accdb_export.py accdb_export.db --from 2026-06-01
+
+--from / --to are inclusive YYYY-MM-DD filters on the job's start date; use them
+to import only the gap period and leave already-billed months untouched.
 """
+import argparse
 import sys
 import sqlite3
 from pathlib import Path
@@ -25,7 +31,16 @@ def _key(start_time: str, job_name: str):
 
 
 def main():
-    export_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("accdb_export.db")
+    ap = argparse.ArgumentParser(description="Merge an accdb_export.db into the live jobs.db")
+    ap.add_argument("export", nargs="?", default="accdb_export.db",
+                    help="Path to the export DB (default: accdb_export.db)")
+    ap.add_argument("--from", dest="date_from", metavar="YYYY-MM-DD",
+                    help="Only import jobs on/after this date (inclusive)")
+    ap.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD",
+                    help="Only import jobs on/before this date (inclusive)")
+    args = ap.parse_args()
+
+    export_path = Path(args.export)
     if not export_path.exists():
         print(f"Export file not found: {export_path}")
         sys.exit(1)
@@ -37,7 +52,25 @@ def main():
     src.row_factory = sqlite3.Row
     accdb_rows = src.execute("SELECT * FROM accdb_jobs").fetchall()
     src.close()
-    print(f"Export rows: {len(accdb_rows)}")
+
+    # Restrict to the requested date range (inclusive), compared on the date
+    # portion of start_time (ISO text sorts lexically).
+    if args.date_from or args.date_to:
+        kept = []
+        for r in accdb_rows:
+            day = (r["start_time"] or "")[:10]
+            if not day:
+                continue
+            if args.date_from and day < args.date_from:
+                continue
+            if args.date_to and day > args.date_to:
+                continue
+            kept.append(r)
+        rng = f"{args.date_from or '(open)'} .. {args.date_to or '(open)'}"
+        print(f"Export rows: {len(accdb_rows)} ({len(kept)} within {rng})")
+        accdb_rows = kept
+    else:
+        print(f"Export rows: {len(accdb_rows)}")
 
     db = sqlite3.connect(str(SQLITE_DB))
     db.row_factory = sqlite3.Row
@@ -49,10 +82,18 @@ def main():
         if k[0]:
             lookup[k] = r
 
-    # --- 1. Fill missing ink/user on existing jobs ---
+    # --- 1. Fill missing ink/user on existing jobs (within the date range) ---
+    clauses = ["InkUse_PK IS NULL"]
+    params: list = []
+    if args.date_from:
+        clauses.append("substr(start_time, 1, 10) >= ?")
+        params.append(args.date_from)
+    if args.date_to:
+        clauses.append("substr(start_time, 1, 10) <= ?")
+        params.append(args.date_to)
     missing = db.execute(
-        "SELECT job_id, start_time, job_name FROM jobs WHERE InkUse_PK IS NULL"
-    ).fetchall()
+        "SELECT job_id, start_time, job_name FROM jobs WHERE " + " AND ".join(clauses),
+        params).fetchall()
     print(f"Jobs missing ink: {len(missing)}")
 
     set_cols = ", ".join(f"InkUse_{ch} = ?" for ch in INK_CHANNELS)

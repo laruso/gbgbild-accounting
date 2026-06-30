@@ -271,9 +271,16 @@ python3 merge_accdb_export.py accdb_export.db
 
 `merge_accdb_export.py` fills missing user/ink on existing jobs and inserts jobs
 the Pi never saw, **never overwriting data already present**, and is safe to run
-more than once. ⚠️ Merged jobs come in with `sent_at` unset, so `send-batch`
-will treat them as billable — if those months were already invoiced through the
-old tool, scope your sends by date range to avoid double-billing.
+more than once. Restrict it to the gap period with inclusive `--from`/`--to`
+date filters so already-billed months are never touched:
+
+```bash
+python3 merge_accdb_export.py accdb_export.db --from 2026-06-01 --to 2026-06-30
+```
+
+⚠️ Merged jobs come in with `sent_at` unset, so `send-batch` will treat them as
+billable — scope both the merge *and* your sends to the gap range to avoid
+double-billing months the old tool already invoiced.
 
 ## Commands reference
 
