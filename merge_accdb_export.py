@@ -3,10 +3,13 @@
 Merge an accdb_export.db (from export_accdb.py on the Windows PC) into the live
 jobs.db on the Pi.
 
-  - Fills username / machine / ink on jobs that currently lack ink, matched by
-    start-minute + job-name prefix (with +/- 1 minute tolerance).
+  - Fills username / machine / ink on jobs that currently lack it, matched by
+    job-name prefix + same calendar day (nearest time, one .accdb row per job).
   - Inserts .accdb jobs that aren't in the DB at all.
-  - Never overwrites data we already have, and is safe to run more than once.
+  - Keeps every existing row, including jobs the .accdb never had (the LFP tool
+    "lost jobs"). Never overwrites real data; safe to run more than once.
+  - --replace (with --from/--to) instead wipes the range and imports the .accdb
+    verbatim — only for gap months where the .accdb is the complete truth.
 
 Usage (on the Pi):
     python3 merge_accdb_export.py [accdb_export.db]
@@ -19,15 +22,21 @@ to import only the gap period and leave already-billed months untouched.
 import argparse
 import sys
 import sqlite3
+from collections import defaultdict
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 
 SQLITE_DB = Path.home() / ".lfp_accounting" / "jobs.db"
 INK_CHANNELS = ["PK", "MK", "C", "VM", "Y", "OR", "GR", "LC", "VLM", "LK", "LLK", "V"]
 
 
-def _key(start_time: str, job_name: str):
-    return (start_time or "")[:16], (job_name or "")[:20]
+def _parse(start_time: str):
+    """Parse an ISO start_time to a naive datetime (drops tz), or None."""
+    try:
+        return datetime.fromisoformat(
+            (start_time or "").replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return None
 
 
 def main():
@@ -114,88 +123,101 @@ def main():
         db.close()
         return
 
-    # Build lookup: (start_minute, name_prefix) -> export row.
-    lookup = {}
+    # Match by (name prefix + same calendar day), greedily consuming each .accdb
+    # row at most once. This is far more robust than +/-1 minute: the SNMP
+    # job-log timestamps drift from the .accdb's by minutes (and a file printed
+    # as a batch yields many same-named rows), so exact-minute matching missed
+    # most jobs. Same-day + nearest-time + one-to-one consumption tolerates the
+    # drift and pairs duplicates sensibly, while keeping every existing row —
+    # including jobs the .accdb never had (the LFP "lost jobs").
+    cands = defaultdict(list)   # name_prefix -> [[datetime, row, consumed], ...]
     for r in accdb_rows:
-        k = _key(r["start_time"], r["job_name"])
-        if k[0]:
-            lookup[k] = r
+        dt = _parse(r["start_time"])
+        if dt:
+            cands[(r["job_name"] or "")[:20]].append([dt, r, False])
+    for lst in cands.values():
+        lst.sort(key=lambda x: x[0])
 
-    # --- 1. Fill missing ink/user on existing jobs (within the date range) ---
-    # "Missing" means no ink at all (NULL) OR an all-zero total — the latter are
-    # entries the printer hadn't populated when we pulled, which the .accdb has
-    # the real value for. The update SETs ink directly, so zeros get overwritten.
+    def take_match(name_prefix, dt):
+        """Nearest unconsumed same-day .accdb row for this name; consume it."""
+        best, best_d = None, None
+        for item in cands.get(name_prefix, ()):
+            if item[2] or item[0].date() != dt.date():
+                continue
+            d = abs((item[0] - dt).total_seconds())
+            if best_d is None or d < best_d:
+                best, best_d = item, d
+        if best is not None:
+            best[2] = True
+            return best[1]
+        return None
+
     ink_total = "(" + " + ".join("COALESCE(InkUse_%s, 0)" % ch for ch in INK_CHANNELS) + ")"
-    clauses = [f"(InkUse_PK IS NULL OR {ink_total} = 0)"]
+    clauses = ["start_time IS NOT NULL"]
     params: list = []
     if args.date_from:
-        clauses.append("substr(start_time, 1, 10) >= ?")
-        params.append(args.date_from)
+        clauses.append("substr(start_time, 1, 10) >= ?"); params.append(args.date_from)
     if args.date_to:
-        clauses.append("substr(start_time, 1, 10) <= ?")
-        params.append(args.date_to)
-    missing = db.execute(
-        "SELECT job_id, start_time, job_name FROM jobs WHERE " + " AND ".join(clauses),
-        params).fetchall()
-    print(f"Jobs missing ink: {len(missing)}")
+        clauses.append("substr(start_time, 1, 10) <= ?"); params.append(args.date_to)
+    ours = db.execute(
+        f"SELECT job_id, start_time, job_name, username, InkUse_PK, {ink_total} tot "
+        f"FROM jobs WHERE {' AND '.join(clauses)} ORDER BY start_time", params).fetchall()
 
     set_cols = ", ".join(f"InkUse_{ch} = ?" for ch in INK_CHANNELS)
-    update_sql = f"""
-        UPDATE jobs SET
-            username     = COALESCE(NULLIF(username, ''), ?),
-            machine_name = COALESCE(NULLIF(machine_name, ''), ?),
-            {set_cols}
-        WHERE job_id = ?
-    """
-    updated = not_matched = 0
+    fill_ink_sql = f"UPDATE jobs SET {set_cols} WHERE job_id = ?"
+    fill_user_sql = ("UPDATE jobs SET username = COALESCE(NULLIF(username,''), ?), "
+                     "machine_name = COALESCE(NULLIF(machine_name,''), ?) WHERE job_id = ?")
+
+    def is_missing(row):
+        return row["InkUse_PK"] is None or (row["tot"] or 0) == 0
+
+    # Missing-ink jobs get first pick of the .accdb rows; already-inked jobs then
+    # consume any remaining match so it can't be re-inserted as a duplicate.
+    missing_jobs = [r for r in ours if is_missing(r)]
+    inked_jobs = [r for r in ours if not is_missing(r)]
+
+    # --- 1. Fill / match existing jobs ---
+    filled_ink = filled_user = matched = unmatched = 0
     with db:
-        for row in missing:
-            k = _key(row["start_time"], row["job_name"])
-            r = lookup.get(k)
-            if not r:  # try +/- 1 minute
-                try:
-                    dt = datetime.fromisoformat((row["start_time"] or "").replace("Z", "+00:00"))
-                    for delta in (-1, 1):
-                        alt = (dt + timedelta(minutes=delta)).strftime("%Y-%m-%dT%H:%M")
-                        r = lookup.get((alt, k[1]))
-                        if r:
-                            break
-                except ValueError:
-                    r = None
-            if not r:
-                not_matched += 1
+        for row in missing_jobs + inked_jobs:
+            dt = _parse(row["start_time"])
+            if not dt:
                 continue
-            ink_vals = [r[f"InkUse_{ch}"] for ch in INK_CHANNELS]
-            db.execute(update_sql, (
-                (r["username"] or None), (r["machine_name"] or None),
-                *ink_vals, row["job_id"]))
-            updated += 1
-    print(f"  {updated} filled, {not_matched} not matched in export")
+            r = take_match((row["job_name"] or "")[:20], dt)
+            if r is None:
+                unmatched += 1
+                continue
+            matched += 1
+            if is_missing(row):
+                db.execute(fill_ink_sql,
+                           (*[r[f"InkUse_{ch}"] for ch in INK_CHANNELS], row["job_id"]))
+                filled_ink += 1
+            if not (row["username"] or "").strip() and (r["username"] or "").strip():
+                db.execute(fill_user_sql,
+                           (r["username"] or None, r["machine_name"] or None, row["job_id"]))
+                filled_user += 1
+    print(f"In-range jobs: {len(ours)}  matched to .accdb: {matched}  "
+          f"(unmatched / lost jobs kept: {unmatched})")
+    print(f"  filled ink on {filled_ink}, filled username on {filled_user}")
 
-    # --- 2. Insert export jobs not present at all ---
-    existing = set()
-    for row in db.execute("SELECT start_time, job_name FROM jobs"):
-        existing.add(_key(row["start_time"], row["job_name"]))
-
+    # --- 2. Insert .accdb rows that no job consumed (jobs we never captured) ---
     cols = (["job_id", "job_name", "username", "machine_name", "start_time"]
             + [f"InkUse_{ch}" for ch in INK_CHANNELS])
     insert_sql = (f"INSERT OR IGNORE INTO jobs ({', '.join(cols)}) "
                   f"VALUES ({','.join('?' * len(cols))})")
     inserted = 0
     with db:
-        for r in accdb_rows:
-            st = r["start_time"] or ""
-            k = _key(st, r["job_name"])
-            if not st or k in existing:
-                continue
-            job_id = f"{st}|{(r['job_name'] or '')}"
-            ink_vals = [r[f"InkUse_{ch}"] for ch in INK_CHANNELS]
-            db.execute(insert_sql, (
-                job_id, r["job_name"], r["username"] or "", r["machine_name"] or "",
-                st, *ink_vals))
-            inserted += 1
-            existing.add(k)
-    print(f"  {inserted} new jobs inserted from export")
+        for lst in cands.values():
+            for dt, r, consumed in lst:
+                if consumed:
+                    continue
+                st = r["start_time"] or ""
+                job_id = f"{st}|{r['job_name'] or ''}"
+                db.execute(insert_sql, (
+                    job_id, r["job_name"], r["username"] or "", r["machine_name"] or "",
+                    st, *[r[f"InkUse_{ch}"] for ch in INK_CHANNELS]))
+                inserted += 1
+    print(f"  inserted {inserted} .accdb job(s) we didn't have")
 
     total = db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
     with_ink = db.execute("SELECT COUNT(*) FROM jobs WHERE InkUse_PK IS NOT NULL").fetchone()[0]
