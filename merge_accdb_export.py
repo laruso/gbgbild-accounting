@@ -38,6 +38,12 @@ def main():
                     help="Only import jobs on/after this date (inclusive)")
     ap.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD",
                     help="Only import jobs on/before this date (inclusive)")
+    ap.add_argument("--replace", action="store_true",
+                    help="Authoritative mode: DELETE existing jobs in the date "
+                         "range and import the .accdb's rows for it verbatim. "
+                         "Requires --from and --to. Use for gap months where the "
+                         ".accdb is the complete source of truth and per-job "
+                         "timestamps don't line up for matching.")
     args = ap.parse_args()
 
     export_path = Path(args.export)
@@ -74,6 +80,39 @@ def main():
 
     db = sqlite3.connect(str(SQLITE_DB))
     db.row_factory = sqlite3.Row
+
+    # --- Authoritative replace mode (for gap months) ---
+    if args.replace:
+        if not (args.date_from and args.date_to):
+            print("--replace requires both --from and --to (refusing to replace "
+                  "the whole database).")
+            sys.exit(1)
+        ins_cols = (["job_id", "job_name", "username", "machine_name", "start_time"]
+                    + [f"InkUse_{ch}" for ch in INK_CHANNELS])
+        ins_sql = (f"INSERT INTO jobs ({', '.join(ins_cols)}) "
+                   f"VALUES ({','.join('?' * len(ins_cols))})")
+        with db:
+            deleted = db.execute(
+                "DELETE FROM jobs WHERE substr(start_time,1,10) BETWEEN ? AND ?",
+                (args.date_from, args.date_to)).rowcount
+            inserted = 0
+            for i, r in enumerate(accdb_rows):
+                st = r["start_time"] or ""
+                if not st:
+                    continue
+                # Unique id per .accdb row (these gap rows are never re-pulled).
+                job_id = f"{st}|{(r['job_name'] or '')[:40]}|accdb{i}"
+                ink = [r[f"InkUse_{ch}"] for ch in INK_CHANNELS]
+                db.execute(ins_sql, (job_id, r["job_name"], r["username"] or "",
+                                     r["machine_name"] or "", st, *ink))
+                inserted += 1
+        total = db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        with_ink = db.execute("SELECT COUNT(*) FROM jobs WHERE InkUse_PK IS NOT NULL").fetchone()[0]
+        print(f"REPLACE {args.date_from}..{args.date_to}: deleted {deleted} existing "
+              f"row(s), inserted {inserted} from .accdb.")
+        print(f"DB now: {total} total jobs, {with_ink} with ink data")
+        db.close()
+        return
 
     # Build lookup: (start_minute, name_prefix) -> export row.
     lookup = {}
