@@ -5,9 +5,12 @@ jobs.db on the Pi.
 
   - Fills username / machine / ink on jobs that currently lack it, matched by
     job-name prefix + same calendar day (nearest time, one .accdb row per job).
-  - Inserts .accdb jobs that aren't in the DB at all.
-  - Keeps every existing row, including jobs the .accdb never had (the LFP tool
-    "lost jobs"). Never overwrites real data; safe to run more than once.
+  - Keeps every existing row untouched otherwise, including jobs the .accdb
+    never had (the LFP "lost jobs"). Never overwrites real data; idempotent.
+  - Fill-only by default: it does NOT add .accdb rows as new jobs. The SNMP
+    capture is the source of truth for which jobs exist, so inserting .accdb
+    rows would duplicate them (and its aggregate "Lost Job (N)" entries would
+    double-count). Pass --insert only if you truly want the extras.
   - --replace (with --from/--to) instead wipes the range and imports the .accdb
     verbatim — only for gap months where the .accdb is the complete truth.
 
@@ -47,6 +50,12 @@ def main():
                     help="Only import jobs on/after this date (inclusive)")
     ap.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD",
                     help="Only import jobs on/before this date (inclusive)")
+    ap.add_argument("--insert", action="store_true",
+                    help="Also insert .accdb rows that don't match any existing "
+                         "job. OFF by default: the SNMP capture is the source of "
+                         "truth for which jobs exist, so inserting .accdb rows "
+                         "(incl. its aggregate 'Lost Job (N)' entries) would "
+                         "double-count. Default is fill-only.")
     ap.add_argument("--replace", action="store_true",
                     help="Authoritative mode: DELETE existing jobs in the date "
                          "range and import the .accdb's rows for it verbatim. "
@@ -200,24 +209,29 @@ def main():
           f"(unmatched / lost jobs kept: {unmatched})")
     print(f"  filled ink on {filled_ink}, filled username on {filled_user}")
 
-    # --- 2. Insert .accdb rows that no job consumed (jobs we never captured) ---
-    cols = (["job_id", "job_name", "username", "machine_name", "start_time"]
-            + [f"InkUse_{ch}" for ch in INK_CHANNELS])
-    insert_sql = (f"INSERT OR IGNORE INTO jobs ({', '.join(cols)}) "
-                  f"VALUES ({','.join('?' * len(cols))})")
-    inserted = 0
-    with db:
-        for lst in cands.values():
-            for dt, r, consumed in lst:
-                if consumed:
-                    continue
-                st = r["start_time"] or ""
-                job_id = f"{st}|{r['job_name'] or ''}"
-                db.execute(insert_sql, (
-                    job_id, r["job_name"], r["username"] or "", r["machine_name"] or "",
-                    st, *[r[f"InkUse_{ch}"] for ch in INK_CHANNELS]))
-                inserted += 1
-    print(f"  inserted {inserted} .accdb job(s) we didn't have")
+    # --- 2. (opt-in) Insert .accdb rows that no job consumed ---
+    if args.insert:
+        cols = (["job_id", "job_name", "username", "machine_name", "start_time"]
+                + [f"InkUse_{ch}" for ch in INK_CHANNELS])
+        insert_sql = (f"INSERT OR IGNORE INTO jobs ({', '.join(cols)}) "
+                      f"VALUES ({','.join('?' * len(cols))})")
+        inserted = 0
+        with db:
+            for lst in cands.values():
+                for dt, r, consumed in lst:
+                    if consumed:
+                        continue
+                    st = r["start_time"] or ""
+                    job_id = f"{st}|{r['job_name'] or ''}"
+                    db.execute(insert_sql, (
+                        job_id, r["job_name"], r["username"] or "", r["machine_name"] or "",
+                        st, *[r[f"InkUse_{ch}"] for ch in INK_CHANNELS]))
+                    inserted += 1
+        print(f"  inserted {inserted} .accdb job(s) we didn't have")
+    else:
+        unconsumed = sum(1 for lst in cands.values() for it in lst if not it[2])
+        print(f"  fill-only (default): left {unconsumed} unmatched .accdb row(s) "
+              f"un-inserted. Pass --insert to add them.")
 
     total = db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
     with_ink = db.execute("SELECT COUNT(*) FROM jobs WHERE InkUse_PK IS NOT NULL").fetchone()[0]
