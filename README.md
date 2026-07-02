@@ -308,14 +308,25 @@ so ink usage can be billed there. Both use only the Python standard library
 The endpoint URL and `articleNumber` are fixed constants at the top of
 `senders.py` (`BASE_URL`, `ARTICLE_NUMBER`) — edit them there in the unlikely
 event they change. The **only** runtime setting is the Bearer token, which is
-**never** stored in the repo and is read from the environment:
+**never** stored in the repo. It is resolved in this order:
+
+1. `LFP_SEND_TOKEN` in the environment — wins if set (handy for one-offs / CI).
+2. `~/.lfp_accounting/token` — a local, gitignored file alongside `jobs.db`.
+   Set it once and every later send picks it up automatically.
 
 ```bash
+# Option A — per-shell environment variable
 export LFP_SEND_TOKEN=<your-token>
 python lfp_accounting.py send-batch          # sends last month's jobs
+
+# Option B — store it once, then just send
+mkdir -p ~/.lfp_accounting
+printf %s '<your-token>' > ~/.lfp_accounting/token
+python lfp_accounting.py send-batch          # token read from the file
 ```
 
-If `LFP_SEND_TOKEN` is unset, the command exits with an error and sends nothing.
+If neither source provides a token, the command exits with an error and sends
+nothing.
 
 ### What gets sent
 

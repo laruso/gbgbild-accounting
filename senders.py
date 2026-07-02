@@ -3,17 +3,22 @@ HTTP client for pushing print-job accounting data to the shop endpoint.
 
 Uses only the standard library (urllib). The endpoint URL and articleNumber are
 fixed constants below (edit them here if they ever change). The only runtime
-configuration is the Bearer token, read from the environment so it never lives
-in the repo:
+configuration is the Bearer token, which never lives in the repo. It is resolved
+in this order:
 
-    LFP_SEND_TOKEN     Bearer token (REQUIRED).
+    LFP_SEND_TOKEN            Bearer token from the environment (wins if set).
+    ~/.lfp_accounting/token   Local token file (gitignored), read if the env
+                              var is unset. Set it once and forget it.
 """
 import os
 import json
 import urllib.request
 import urllib.error
+from pathlib import Path
 
 from joblog import INK_CHANNELS
+
+TOKEN_FILE = Path.home() / ".lfp_accounting" / "token"
 
 BASE_URL = "https://shop.goteborgsbildverkstad.se/api/shop/printer01"
 ARTICLE_NUMBER = "11"
@@ -26,10 +31,15 @@ class SendError(Exception):
 
 def _token() -> str:
     token = os.environ.get("LFP_SEND_TOKEN")
+    if not token and TOKEN_FILE.exists():
+        token = TOKEN_FILE.read_text(encoding="utf-8").strip()
     if not token:
         raise SendError(
-            "LFP_SEND_TOKEN is not set. Export the Bearer token before sending, e.g.\n"
-            "    export LFP_SEND_TOKEN=<your-token>")
+            "No Bearer token found. Either export it for this shell:\n"
+            "    export LFP_SEND_TOKEN=<your-token>\n"
+            "or store it once (gitignored, read automatically from then on):\n"
+            "    mkdir -p %s && printf %%s '<your-token>' > %s" % (
+                TOKEN_FILE.parent, TOKEN_FILE))
     return token
 
 

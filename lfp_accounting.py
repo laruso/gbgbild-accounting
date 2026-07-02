@@ -13,8 +13,9 @@ Usage:
   python3 lfp_accounting.py send <index> [--resend]
   python3 lfp_accounting.py send-batch [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--resend]
 
-Sending requires the Bearer token in the environment (never committed):
+Sending requires the Bearer token (never committed). Either export it:
   export LFP_SEND_TOKEN=<token>
+or store it once in ~/.lfp_accounting/token (gitignored, read automatically).
 """
 import argparse
 import csv
