@@ -15,3 +15,11 @@
 # to override it.
 
 */15 * * * * cd /home/gbgbild/gbgbild-accounting && /usr/bin/python3 lfp_accounting.py --printer 192.168.1.55 pull >> /home/gbgbild/gbgbild-accounting/pull.log 2>&1
+
+# Monthly billing — send the PREVIOUS month's jobs to the shop endpoint.
+# Runs 06:00 on days 1-7. send-batch with no date args defaults to the previous
+# calendar month; it is idempotent (marks jobs sent), so day 1 sends and days 2-7
+# are no-ops ("No sendable jobs"). The 1-7 window auto-retries a failed 1st, so a
+# network/endpoint blip on the 1st doesn't silently skip a month's billing.
+# Requires the Bearer token in ~/.lfp_accounting/token (cron has no exported env).
+0 6 1-7 * * cd /home/gbgbild/gbgbild-accounting && /usr/bin/python3 lfp_accounting.py send-batch >> /home/gbgbild/gbgbild-accounting/send-batch.log 2>&1

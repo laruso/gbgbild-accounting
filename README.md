@@ -225,6 +225,25 @@ sudo systemctl start lfp-accounting.service   # run once immediately
 The timer config has `Persistent=true`, so if the Pi was off when a
 scheduled run was due, it catches up on the missed run when it boots.
 
+### Monthly billing (send-batch)
+
+The `pull` schedule above only collects jobs into the local DB. To bill them,
+`send-batch` POSTs the **previous calendar month's** jobs to the shop endpoint —
+and it computes that range itself, so no date arguments are needed. Add a second
+line via `crontab -e` (already included in `deploy/crontab.example`):
+
+```cron
+0 6 1-7 * * cd /home/gbgbild/gbgbild-accounting && /usr/bin/python3 lfp_accounting.py send-batch >> /home/gbgbild/gbgbild-accounting/send-batch.log 2>&1
+```
+
+This runs at 06:00 on the 1st through the 7th. Because `send-batch` marks each
+job `sent_at` and skips already-sent jobs, the 1st sends last month's batch and
+days 2–7 are harmless no-ops — the week-long window auto-retries so a network or
+endpoint blip on the 1st never silently drops a month's billing.
+
+It depends on the Bearer token being stored at `~/.lfp_accounting/token` (cron
+has no exported environment); see [Configuration](#configuration).
+
 ## Backfilling from the old `.accdb` (Windows only, already done)
 
 The historical data has already been imported and is included in
