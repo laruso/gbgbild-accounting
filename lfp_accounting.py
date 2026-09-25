@@ -28,7 +28,7 @@ from pathlib import Path
 from joblog import fetch_job_log, fetch_ink_status, STATUS_CODE, INK_CHANNELS
 from store  import (upsert_jobs, all_jobs, rebuild_monthly_summary, get_monthly_summary,
                     query_jobs, monthly_summary, mark_sent,
-                    set_meta, redecrypt_stored_blobs)
+                    set_meta, redecrypt_stored_blobs, archive_raw)
 import senders
 
 
@@ -58,7 +58,10 @@ def cmd_pull(args):
     serial = _resolve_serial(args)
 
     print("Fetching up to 499 job records (may take 2-4 minutes)...")
-    records = fetch_job_log(args.printer, community=args.community, serial=serial or "")
+    raw: list = []
+    records = fetch_job_log(args.printer, community=args.community,
+                            serial=serial or "", raw_sink=raw)
+    archived = archive_raw(raw) if raw else 0
     if not records:
         print("No job records found.")
         return
@@ -75,6 +78,7 @@ def cmd_pull(args):
     if recovered:
         print("  %d earlier job(s) recovered ink from stored blobs" % recovered)
     print("  %d total jobs retrieved from printer" % len(records))
+    print("  %d new raw capture(s) archived" % archived)
     print("  %d jobs with ink usage data" % ink_count)
 
     if records:

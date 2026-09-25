@@ -1,10 +1,11 @@
 """
 SQLite storage for Epson SC-P9500 job log records.
 """
+import hashlib
 import sqlite3
 from pathlib import Path
 from typing import Optional
-from joblog import JobRecord, decode_ji_ink, INK_CHANNELS
+from joblog import JobRecord, decode_ji_info, INK_CHANNELS
 
 _DEFAULT_DB = Path.home() / ".lfp_accounting" / "jobs.db"
 
@@ -93,7 +94,53 @@ def _ensure_schema(conn: sqlite3.Connection):
             value TEXT
         )
     """)
+    # Append-only archive of exactly what the printer returned: every distinct
+    # job-log row snapshot ("row") and ji: entry ("ji"). Never updated except
+    # for last_seen/seen_count, never deleted — so any matching or repair logic
+    # can be re-run against the original data later. Deduped by content hash,
+    # so the 15-minute polls only add rows when something actually changed.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS raw_capture (
+            sha1        TEXT PRIMARY KEY,
+            kind        TEXT NOT NULL,
+            slot        INTEGER,
+            counter     INTEGER,
+            payload     BLOB NOT NULL,
+            first_seen  TEXT DEFAULT (datetime('now')),
+            last_seen   TEXT DEFAULT (datetime('now')),
+            seen_count  INTEGER DEFAULT 1
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS raw_capture_counter "
+                 "ON raw_capture (kind, counter)")
+    conn.execute("CREATE INDEX IF NOT EXISTS jobs_counter ON jobs (counter)")
     conn.commit()
+
+
+def archive_raw(items: list[dict], db_path: Optional[Path] = None) -> int:
+    """Store raw printer captures (from fetch_job_log's raw_sink).
+
+    Returns the number of new distinct captures added.
+    """
+    db_path = db_path or _DEFAULT_DB
+    conn = _connect(db_path)
+    added = 0
+    with conn:
+        for it in items:
+            payload = it["payload"]
+            digest = hashlib.sha1(it["kind"].encode() + b"\0" + payload).hexdigest()
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO raw_capture (sha1, kind, slot, counter, payload) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (digest, it["kind"], it.get("slot"), it.get("counter"), payload))
+            if cur.rowcount:
+                added += 1
+            else:
+                conn.execute(
+                    "UPDATE raw_capture SET last_seen = datetime('now'), "
+                    "seen_count = seen_count + 1 WHERE sha1 = ?", (digest,))
+    conn.close()
+    return added
 
 
 def get_meta(key: str, db_path: Optional[Path] = None) -> Optional[str]:
@@ -124,7 +171,9 @@ def redecrypt_stored_blobs(serial: str, db_path: Optional[Path] = None) -> int:
 
     Recovers ink that was lost when the serial number was unavailable at pull
     time: the raw 208-byte blob is always stored, so once a valid serial is
-    known we can decrypt it after the fact. Returns the number of jobs updated.
+    known we can decrypt it after the fact. Only applies a blob whose embedded
+    counter matches the job's own counter — older pulls attached blobs by
+    position and some sit on the neighbouring job. Returns jobs updated.
     """
     if not serial:
         return 0
@@ -134,16 +183,16 @@ def redecrypt_stored_blobs(serial: str, db_path: Optional[Path] = None) -> int:
     set_cols = ", ".join("InkUse_%s = ?" % ch for ch in INK_CHANNELS)
     conn = _connect(db_path)
     rows = conn.execute(
-        "SELECT job_id, ji_blob FROM jobs "
+        "SELECT job_id, counter, ji_blob FROM jobs "
         "WHERE ji_blob IS NOT NULL AND InkUse_PK IS NULL"
     ).fetchall()
     updated = 0
     with conn:
         for row in rows:
-            ink = decode_ji_ink(row["ji_blob"], serial)
-            if not ink:
+            info = decode_ji_info(row["ji_blob"], serial)
+            if not info or not info["ink"] or info["counter"] != row["counter"]:
                 continue
-            vals = [ink.get(ch) for ch in INK_CHANNELS]
+            vals = [info["ink"].get(ch) for ch in INK_CHANNELS]
             conn.execute(
                 "UPDATE jobs SET %s WHERE job_id = ?" % set_cols,
                 (*vals, row["job_id"]))
@@ -160,7 +209,19 @@ def _job_id(rec: JobRecord) -> str:
 
 def upsert_jobs(records: list[JobRecord],
                 db_path: Optional[Path] = None) -> tuple[int, int]:
-    """Insert new jobs or update existing ones with new data. Returns (inserted, updated)."""
+    """Insert new jobs or update existing ones with new data. Returns (inserted, updated).
+
+    A job is identified by its printer counter (unique per job); job_id is
+    only the fallback for records without one. Matching on start time + name
+    alone let a single bad pull (e.g. a missing start time) store the same
+    print a second time.
+
+    Ink and username on a record come from a ji: blob whose embedded counter
+    matched this job (see joblog._match_ji_by_counter), so they are
+    authoritative: they replace whatever is stored, which also repairs values
+    earlier versions attached to the wrong job. A record without them never
+    blanks existing data.
+    """
     db_path = db_path or _DEFAULT_DB
     conn = _connect(db_path)
     insert_sql = """
@@ -176,66 +237,61 @@ def upsert_jobs(records: list[JobRecord],
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """
     ink_ch = ["PK", "MK", "C", "VM", "Y", "OR", "GR", "LC", "VLM", "LK", "LLK", "V"]
-    # Fill (or repair) a job's data without ever clobbering a real value:
-    #  - username/machine: fill only when currently blank.
-    #  - ink: replace when the existing total is 0 (NULL, or an all-zero row we
-    #    stored before the printer had populated the blob — a real print always
-    #    uses ink, so a stored 0 is "not captured yet"); keep it once it's real.
-    #    The printer keeps the real ink in its buffer for a while, so a later
-    #    pull repairs these stuck zeros directly — no .accdb needed.
-    # The WHERE fires only when there is genuinely something to add: new ink for
-    # an ink-less/zero job, or a username for one still missing it.
-    ink_total = "(" + " + ".join("COALESCE(InkUse_%s, 0)" % ch for ch in ink_ch) + ")"
-    ink_set = ", ".join(
-        "InkUse_{c} = CASE WHEN {t} = 0 THEN COALESCE(?, InkUse_{c}) "
-        "ELSE InkUse_{c} END".format(c=ch, t=ink_total) for ch in ink_ch)
-    update_sql = f"""
-        UPDATE jobs SET
-            username     = COALESCE(NULLIF(username, ''), ?),
-            machine_name = COALESCE(NULLIF(machine_name, ''), ?),
-            {ink_set},
-            ji_blob      = COALESCE(ji_blob, ?)
-        WHERE job_id = ?
-          AND ( ({ink_total} = 0 AND ? IS NOT NULL)
-                OR ((username IS NULL OR username = '') AND ? IS NOT NULL) )
-    """
+    ink_set = ", ".join("InkUse_%s = ?" % ch for ch in ink_ch)
     inserted = updated = 0
     with conn:
         for rec in records:
-            jid = _job_id(rec)
             ink_vals = [rec.ink_use.get(ch) if rec.ink_use else None for ch in ink_ch]
-            cur = conn.execute(insert_sql, (
-                jid,
-                rec.job_name,
-                rec.username,
-                rec.machine_name,
-                rec.start_time.isoformat() if rec.start_time else None,
-                rec.end_time.isoformat()   if rec.end_time   else None,
-                rec.print_secs,
-                rec.paper_source,
-                rec.width_mm,
-                rec.length_mm,
-                rec.area_cm2,
-                rec.media_type_id,
-                rec.status_code,
-                rec.counter,
-                *ink_vals,
-                rec.ji_blob,
-            ))
-            if cur.rowcount > 0:
-                inserted += 1
-            elif rec.ink_use or rec.username:
-                cur = conn.execute(update_sql, (
-                    rec.username or None,
-                    rec.machine_name or None,
-                    *ink_vals,
-                    rec.ji_blob,
-                    jid,
-                    ink_vals[0],            # new InkUse_PK — guards the ink fill
-                    rec.username or None,   # new username — guards the user fill
+            start = rec.start_time.isoformat() if rec.start_time else None
+            end   = rec.end_time.isoformat()   if rec.end_time   else None
+
+            existing = None
+            if rec.counter is not None:
+                existing = conn.execute(
+                    "SELECT * FROM jobs WHERE counter = ? ORDER BY start_time IS NULL, "
+                    "end_time LIMIT 1", (rec.counter,)).fetchone()
+            if existing is None:
+                existing = conn.execute("SELECT * FROM jobs WHERE job_id = ?",
+                                        (_job_id(rec),)).fetchone()
+
+            if existing is None:
+                conn.execute(insert_sql, (
+                    _job_id(rec), rec.job_name, rec.username, rec.machine_name,
+                    start, end, rec.print_secs,
+                    rec.paper_source, rec.width_mm, rec.length_mm, rec.area_cm2,
+                    rec.media_type_id, rec.status_code, rec.counter,
+                    *ink_vals, rec.ji_blob,
                 ))
-                if cur.rowcount > 0:
-                    updated += 1
+                inserted += 1
+                continue
+
+            jid = existing["job_id"]
+            changed = False
+            # Fill identity fields a bad earlier pull left empty.
+            if (existing["start_time"] is None and start) or \
+               (existing["end_time"] is None and end):
+                conn.execute(
+                    "UPDATE jobs SET start_time = COALESCE(start_time, ?), "
+                    "end_time = COALESCE(end_time, ?), "
+                    "print_secs = COALESCE(print_secs, ?) WHERE job_id = ?",
+                    (start, end, rec.print_secs, jid))
+                changed = True
+            if rec.ink_use:
+                old = [existing["InkUse_" + ch] for ch in ink_ch]
+                if old != ink_vals or existing["ji_blob"] != rec.ji_blob:
+                    conn.execute("UPDATE jobs SET %s, ji_blob = ? WHERE job_id = ?"
+                                 % ink_set, (*ink_vals, rec.ji_blob, jid))
+                    changed = True
+            if rec.username and (existing["username"] != rec.username or
+                                 (rec.machine_name and
+                                  existing["machine_name"] != rec.machine_name)):
+                conn.execute(
+                    "UPDATE jobs SET username = ?, "
+                    "machine_name = COALESCE(NULLIF(?, ''), machine_name) "
+                    "WHERE job_id = ?", (rec.username, rec.machine_name, jid))
+                changed = True
+            if changed:
+                updated += 1
     conn.close()
     return inserted, updated
 

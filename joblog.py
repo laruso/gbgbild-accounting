@@ -18,6 +18,7 @@ Ink levels: standard RFC-3805 Printer-MIB
   1.3.6.1.2.1.43.11.1.1.{6,8,9}.1.N  (name, max, level)
 """
 
+import json
 import socket
 import struct
 import logging
@@ -430,6 +431,63 @@ def decode_ji_ink(blob: bytes, serial: str) -> Optional[dict]:
         return None
 
 
+def _iter_tlv(decrypted: bytes) -> dict:
+    """Split the decrypted ji: TLV into {tag: value_bytes}."""
+    out = {}
+    i = 0
+    while i < len(decrypted) - 1 and decrypted[i] != 0:
+        tag, length = decrypted[i], decrypted[i + 1]
+        if i + 2 + length > len(decrypted):
+            break
+        out[tag] = decrypted[i + 2:i + 2 + length]
+        i += 2 + length
+    return out
+
+
+def _decode_ji_time(raw: bytes) -> Optional[datetime]:
+    """ji: timestamps are 6 bytes: yy mm dd hh mm ss (local printer time).
+    All-zero means the printer hasn't filled the entry in yet."""
+    if len(raw) != 6 or not any(raw):
+        return None
+    try:
+        return datetime(2000 + raw[0], raw[1], raw[2], raw[3], raw[4], raw[5])
+    except ValueError:
+        return None
+
+
+def decode_ji_info(blob: bytes, serial: str) -> Optional[dict]:
+    """Decrypt a ji: blob into its identity and usage fields.
+
+    Returns {"counter", "start", "end", "ink"} or None if undecryptable.
+    The blob carries its OWN job counter (tag 0x03) — the same value as the
+    job-log counter column — plus start (0x12) and end (0x13) times. That is
+    what ties a blob to exactly one job; never match blobs by position.
+    "ink" follows decode_ji_ink's rule (None when all-zero / not yet filled).
+    """
+    if not blob or len(blob) != 208 or not serial:
+        return None
+    try:
+        tlv = _iter_tlv(_decrypt_ji_blob(blob, serial))
+    except Exception as e:
+        log.debug("Blob decryption failed: %s", e)
+        return None
+    raw_counter = tlv.get(0x03)
+    if not raw_counter or len(raw_counter) != 4:
+        return None
+    ink = None
+    raw_ink = tlv.get(0x0F)
+    if raw_ink and len(raw_ink) == 24:
+        vals = {ch: struct.unpack_from("<H", raw_ink, n * 2)[0]
+                for n, ch in enumerate(_DLL_INK_ORDER)}
+        ink = vals if any(vals.values()) else None
+    return {
+        "counter": struct.unpack("<I", raw_counter)[0],
+        "start":   _decode_ji_time(tlv.get(0x12, b"")),
+        "end":     _decode_ji_time(tlv.get(0x13, b"")),
+        "ink":     ink,
+    }
+
+
 def fetch_serial_number(host: str, community: str = "epson",
                         timeout: float = 4.0) -> Optional[str]:
     """
@@ -476,72 +534,42 @@ def fetch_serial_number(host: str, community: str = "epson",
 # Matching ji: entries to job-log rows
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _align_ji_to_rows(ji_meta: dict, counters: dict, names: dict) -> dict:
-    """Map each job-log row index to its ji: metadata entry, by recency.
+def _match_ji_by_counter(ji_meta: dict, row_counters: dict, serial: str) -> dict:
+    """Map job-log row index -> ji: entry, keyed on the job counter.
 
-    The job log and the ji: buffer both list jobs newest-first, so they line up
-    by position: the newest job-log row corresponds to ji index 0, the next to
-    index 1, and so on. This is far more reliable than matching by job name —
-    roughly half the ji: entries carry no job name at all (only a blob), and the
-    job-log name format differs from the ji: name, so name matching silently
-    drops most blobs (and with them all ink + username data).
+    Every decrypted ji: blob carries the job counter it belongs to (tag 0x03),
+    which equals the job-log counter column. Matching on it is exact. The old
+    positional alignment (newest row = ji index 0) shifted by one whenever the
+    two lists didn't hold exactly the same jobs — e.g. a job in the log with no
+    ji: entry, or a print finishing mid-pull — and then every ink value and
+    username landed on the neighbouring job. Entries we can't decrypt (no
+    serial) or whose counter isn't in the log are left unattached: a missing
+    value is recoverable later, a wrong one silently mis-bills.
 
-    The printer mirrors the whole buffer at index >= 256; those duplicates are
-    ignored. The alignment offset is auto-detected and verified against the ji:
-    entries that *do* carry a job name; if that verification is weak we fall
-    back to name-prefix matching so a blob is never attributed to the wrong job.
-
+    Each matched entry gets "ji_info" (decode_ji_info result) added.
     Returns {row_index: ji_meta_entry}.
     """
-    # Recency order: newest job-log row first (highest counter first).
-    rows = sorted(counters, key=lambda i: counters.get(i, 0), reverse=True)
-    # Recency order for ji: index 0 = newest. Skip the mirror block at >= 256.
-    ji_list = [ji_meta[i] for i in sorted(ji_meta) if i < 256]
-    if not rows or not ji_list:
+    if not serial:
+        log.warning("ji: no printer serial — cannot verify blobs, skipping ink/user")
         return {}
-
-    def named_matches(offset: int) -> int:
-        hits = 0
-        for pos, m in enumerate(ji_list):
-            jn = (m.get("job_name") or "").strip()
-            if not jn:
-                continue
-            r = pos + offset
-            if 0 <= r < len(rows):
-                nm = names.get(rows[r], "")
-                if nm and nm[:20] == jn[:20]:
-                    hits += 1
-        return hits
-
-    named = sum(1 for m in ji_list if (m.get("job_name") or "").strip())
-    best_offset, best_hits = 0, -1
-    for off in (0, -1, 1, -2, 2):
-        h = named_matches(off)
-        if h > best_hits:
-            best_offset, best_hits = off, h
-
+    row_by_counter = {c: idx for idx, c in row_counters.items() if c is not None}
     row_meta: dict = {}
-    if named == 0 or best_hits >= max(2, (named + 1) // 2):
-        # Trust positional alignment — this also captures the blob-only
-        # (blank job_name) entries that name matching can never reach.
-        log.info("ji: matched by position (offset %d, %d/%d named entries verified)",
-                 best_offset, best_hits, named)
-        for pos, m in enumerate(ji_list):
-            r = pos + best_offset
-            if 0 <= r < len(rows):
-                row_meta[rows[r]] = m
-    else:
-        # Alignment looks unreliable — fall back to name matching only.
-        log.warning("ji: positional alignment weak (%d/%d verified); "
-                    "falling back to name matching", best_hits, named)
-        for idx, nm in names.items():
-            if not nm:
-                continue
-            for m in ji_list:
-                jn = (m.get("job_name") or "").strip()
-                if jn and nm[:20] == jn[:20]:
-                    row_meta[idx] = m
-                    break
+    unmatched = 0
+    for ji_idx in sorted(ji_meta):
+        if ji_idx >= 256:          # the printer mirrors the buffer at >= 256
+            continue
+        m = ji_meta[ji_idx]
+        info = decode_ji_info(m.get("ji_blob"), serial)
+        if not info:
+            continue
+        row = row_by_counter.get(info["counter"])
+        if row is None:
+            unmatched += 1
+            continue
+        m["ji_info"] = info
+        row_meta[row] = m
+    log.info("ji: %d entries matched to jobs by counter (%d not in job log)",
+             len(row_meta), unmatched)
     return row_meta
 
 
@@ -549,83 +577,144 @@ def _align_ji_to_rows(ji_meta: dict, counters: dict, names: dict) -> dict:
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Job-log columns read for every row (see module docstring).
+_JL_COLS = (2, 3, 5, 6, 8, 9, 10, 11, 12)
+
+
+def _snmp_get_multi_pkt(community: str, oids: list[str]) -> bytes:
+    """SNMP GET with several varbinds in ONE request."""
+    varbinds = b"".join(_tlv(0x30, _tlv(0x06, _encode_oid(o)) + _tlv(0x05, b""))
+                        for o in oids)
+    pdu = _tlv(0xa0,
+               _tlv(0x02, b"\x01") +
+               _tlv(0x02, b"\x00") +
+               _tlv(0x02, b"\x00") +
+               _tlv(0x30, varbinds))
+    return _tlv(0x30, _tlv(0x02, b"\x00") + _tlv(0x04, community.encode()) + pdu)
+
+
+def _get_row(host: str, community: str, timeout: float, row: int) -> Optional[dict]:
+    """Read every column of one job-log row in a single SNMP GET.
+
+    One request = one consistent snapshot of the row, so the name, counter,
+    times and size always belong to the same job. Returns {col: (tag, raw)},
+    {} if the row doesn't exist, or None if the printer didn't answer the
+    multi-varbind request properly.
+    """
+    oids = ["%s.%d" % (_col_root(c), row) for c in _JL_COLS]
+    resp = _snmp_send(host, _snmp_get_multi_pkt(community, oids), timeout)
+    if not resp:
+        return None
+    parsed = _parse_snmp_resp(resp)
+    if len(parsed) != len(oids) or [p[0] for p in parsed] != oids:
+        return None
+    out = {}
+    for col, (_, tag, raw) in zip(_JL_COLS, parsed):
+        if tag not in (0x80, 0x81, 0x82):       # noSuch* / endOfMib
+            out[col] = (tag, raw)
+    return out
+
+
+def _fetch_rows_atomic(host: str, community: str, timeout: float,
+                       max_rows: int = 500) -> Optional[dict]:
+    """Fetch all job-log rows, one GET per row. None if unsupported."""
+    rows: dict = {}
+    empty_run = 0
+    for row in range(1, max_rows + 1):
+        r = _get_row(host, community, timeout, row)
+        if r is None:
+            r = _get_row(host, community, timeout, row)   # one retry
+        if r is None:
+            if row == 1:
+                return None          # printer won't do multi-varbind GETs
+            log.warning("  row %d: no answer, skipping", row)
+            continue
+        if 2 not in r:
+            empty_run += 1
+            if empty_run >= 3:
+                break
+            continue
+        empty_run = 0
+        rows[row] = r
+    return rows
+
+
+def _fetch_rows_walk(host: str, community: str, timeout: float,
+                     attempts: int = 3) -> dict:
+    """Fallback: walk column by column, but only accept a stable snapshot.
+
+    Row 1 is always the newest job, so if a print finishes during the 2-4
+    minute walk every row index shifts by one between columns, and a row ends
+    up with one job's name and the next job's times/size. We re-walk the
+    counter column afterwards and only accept the result when it didn't move.
+    """
+    for attempt in range(1, attempts + 1):
+        cols: dict = {c: {} for c in _JL_COLS}
+        for c in _JL_COLS:
+            for oid, tag, raw in snmp_walk_column(host, _col_root(c), community, timeout):
+                idx = _row_index(oid, c)
+                if idx is not None:
+                    cols[c][idx] = (tag, raw)
+        after = {}
+        for oid, tag, raw in snmp_walk_column(host, _col_root(2), community, timeout):
+            idx = _row_index(oid, 2)
+            if idx is not None:
+                after[idx] = (tag, raw)
+        if after == cols[2] and after:
+            rows: dict = {}
+            for c, vals in cols.items():
+                for idx, v in vals.items():
+                    rows.setdefault(idx, {})[c] = v
+            return {i: r for i, r in rows.items() if 2 in r}
+        log.warning("  job log changed during walk (attempt %d/%d), retrying",
+                    attempt, attempts)
+    log.error("  job log never stable during walk — skipping this pull")
+    return {}
+
+
 def fetch_job_log(host: str, community: str = "public",
-                  timeout: float = 4.0, serial: str = "") -> list[JobRecord]:
+                  timeout: float = 4.0, serial: str = "",
+                  raw_sink: Optional[list] = None) -> list[JobRecord]:
     """
     Fetch all job log entries from the printer via SNMP.
     If serial is provided, decrypts ji: blobs to extract per-job ink usage.
-    Returns a list of JobRecord objects, sorted oldest-first.
+    If raw_sink is a list, every job-log row ("row", JSON of {col: [tag, hex]})
+    and every raw ji: entry ("ji", the bytes from "ji:" on) is appended to it as
+    {"kind", "slot", "counter", "payload"} so the caller can archive exactly
+    what the printer returned.
+    Returns a list of JobRecord objects, sorted oldest-first, one per job
+    counter.
     """
     log.info("Fetching job log from %s via SNMP...", host)
 
-    # Walk each column separately for efficiency
-    counters:    dict[int, int]              = {}
-    names:       dict[int, str]              = {}
-    starts:      dict[int, Optional[datetime]] = {}
-    ends:        dict[int, Optional[datetime]] = {}
-    psrc_codes:  dict[int, int]              = {}
-    widths:      dict[int, int]              = {}
-    lengths:     dict[int, int]              = {}
-    status_codes: dict[int, int]             = {}
-    media_ids:   dict[int, int]              = {}
+    rows = _fetch_rows_atomic(host, community, timeout)
+    if rows is None:
+        log.warning("  multi-varbind GET not supported; falling back to column walk")
+        rows = _fetch_rows_walk(host, community, timeout)
+    log.info("  Found %d job entries", len(rows))
 
-    def walk_int(col: int, dest: dict):
-        for oid, tag, raw in snmp_walk_column(host, _col_root(col), community, timeout):
-            idx = _row_index(oid, col)
-            if idx is None:
-                continue
-            v = _as_int(tag, raw)
-            if v is not None:
-                dest[idx] = v
+    def as_int(r, c):
+        v = r.get(c)
+        return _as_int(*v) if v else None
 
-    def walk_str(col: int, dest: dict):
-        for oid, tag, raw in snmp_walk_column(host, _col_root(col), community, timeout):
-            idx = _row_index(oid, col)
-            if idx is None:
-                continue
-            v = _as_str(tag, raw)
-            if v is not None:
-                dest[idx] = v
+    def as_str(r, c):
+        v = r.get(c)
+        return _as_str(*v) if v else None
 
-    def walk_dt(col: int, dest: dict):
-        for oid, tag, raw in snmp_walk_column(host, _col_root(col), community, timeout):
-            idx = _row_index(oid, col)
-            if idx is None:
-                continue
-            if tag == 0x04 and len(raw) >= 8:
-                dest[idx] = _decode_datetime(raw)
+    def as_dt(r, c):
+        v = r.get(c)
+        if v and v[0] == 0x04 and len(v[1]) >= 8:
+            return _decode_datetime(v[1])
+        return None
 
-    log.info("  Walking column 2 (counter)...")
-    walk_int(2, counters)
-    total = len(counters)
-    log.info("  Found %d job entries", total)
-
-    log.info("  Walking column 3 (job names)...")
-    walk_str(3, names)
-
-    log.info("  Walking column 5 (start times)...")
-    walk_dt(5, starts)
-
-    log.info("  Walking column 6 (end times)...")
-    walk_dt(6, ends)
-
-    log.info("  Walking column 8 (paper source)...")
-    walk_int(8, psrc_codes)
-
-    log.info("  Walking column 9 (width mm)...")
-    walk_int(9, widths)
-
-    log.info("  Walking column 10 (length mm)...")
-    walk_int(10, lengths)
-
-    log.info("  Walking column 11 (status code)...")
-    walk_int(11, status_codes)
-
-    log.info("  Walking column 12 (media type id)...")
-    walk_int(12, media_ids)
-
-    all_rows = sorted(counters.keys())
-    records: list[JobRecord] = []
+    # A job can show up at two row indices if a print finished while we were
+    # reading (everything shifts down by one) — keep one row per counter.
+    by_counter: dict = {}
+    for idx in sorted(rows):
+        c = as_int(rows[idx], 2)
+        if c is not None and c not in by_counter:
+            by_counter[c] = idx
+    row_counters = {idx: c for c, idx in by_counter.items()}
 
     # Fetch ji: metadata for username/machine (uses BDC protocol, community='epson')
     ji_meta = {}
@@ -634,38 +723,48 @@ def fetch_job_log(host: str, community: str = "public",
     except Exception as e:
         log.warning("Could not fetch ji: metadata: %s", e)
 
-    # Join ji: entries to job-log rows by recency position (see _align_ji_to_rows).
-    row_meta = _align_ji_to_rows(ji_meta, counters, names)
+    if raw_sink is not None:
+        for c, idx in by_counter.items():
+            snap = {str(col): [tag, raw.hex()] for col, (tag, raw) in rows[idx].items()}
+            raw_sink.append({"kind": "row", "slot": idx, "counter": c,
+                             "payload": json.dumps(snap, sort_keys=True).encode()})
+        for ji_idx, m in sorted(ji_meta.items()):
+            if ji_idx >= 256 or not m.get("raw"):
+                continue
+            info = decode_ji_info(m.get("ji_blob"), serial) if serial else None
+            raw_sink.append({"kind": "ji", "slot": ji_idx,
+                             "counter": info["counter"] if info else None,
+                             "payload": m["raw"]})
 
-    for idx in all_rows:
-        name = names.get(idx, "")
+    row_meta = _match_ji_by_counter(ji_meta, row_counters, serial)
+
+    records: list[JobRecord] = []
+    for idx, counter in row_counters.items():
+        r = rows[idx]
+        name = as_str(r, 3) or ""
         if not name:
             continue
 
-        start = starts.get(idx)
-        end   = ends.get(idx)
+        start = as_dt(r, 5)
+        end   = as_dt(r, 6)
         secs  = None
         if start and end:
             secs = max(0, int((end - start).total_seconds()))
 
-        w = widths.get(idx)
-        l = lengths.get(idx)
+        w = as_int(r, 9)
+        l = as_int(r, 10)
         area = round(w * l / 100.0, 2) if w and l else None  # cm²
 
-        pcode = psrc_codes.get(idx, 0)
+        pcode = as_int(r, 8) or 0
         psrc  = PAPER_SOURCE.get(pcode, str(pcode))
 
         meta = row_meta.get(idx)
         username     = (meta.get("username") if meta else "") or ""
         machine_name = (meta.get("machine")  if meta else "") or ""
         ji_blob      = meta.get("ji_blob") if meta else None
+        ink_use      = meta["ji_info"]["ink"] if meta else None
 
-        # Decrypt ink usage from ji: blob if serial number available
-        ink_use = None
-        if ji_blob and serial:
-            ink_use = decode_ji_ink(ji_blob, serial)
-
-        rec = JobRecord(
+        records.append(JobRecord(
             job_name      = name,
             username      = username,
             machine_name  = machine_name,
@@ -676,13 +775,12 @@ def fetch_job_log(host: str, community: str = "public",
             width_mm      = w,
             length_mm     = l,
             area_cm2      = area,
-            media_type_id = media_ids.get(idx),
-            status_code   = status_codes.get(idx),
-            counter       = counters.get(idx),
+            media_type_id = as_int(r, 12),
+            status_code   = as_int(r, 11),
+            counter       = counter,
             ink_use       = ink_use,
             ji_blob       = ji_blob,
-        )
-        records.append(rec)
+        ))
 
     # Row 1 = newest, row N = oldest → sort oldest-first by counter ascending
     records.sort(key=lambda r: r.counter or 0)
@@ -810,6 +908,7 @@ def fetch_ji_metadata(host: str, community: str = "epson",
 
         meta = _parse_ji_suffix(suffix)
         meta["ji_blob"] = blob if len(blob) == 208 else None
+        meta["raw"] = bytes(ji_data)   # verbatim, for the raw_capture archive
 
         if meta["username"] or meta["machine"] or meta.get("ji_blob"):
             results[job_idx] = meta
