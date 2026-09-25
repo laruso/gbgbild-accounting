@@ -281,6 +281,40 @@ def main():
                 R.exec("UPDATE jobs SET ji_blob = NULL WHERE job_id = ?", (r["job_id"],))
                 r["ji_blob"] = None
 
+    # 3b. The old upsert could later overwrite a zero-ink job's ink from a
+    # different (mis-positioned) blob while keeping the first stored blob, so
+    # some rows hold another job's exact ink with no blob to show for it. Clear
+    # ink identical to a different job's verified blob when that job has a
+    # different name, or when this job never printed (status 0, 0 s). Same-name
+    # reprints legitimately use identical ink and are left alone.
+    ink_owner = defaultdict(set)
+    payloads = [r["ji_blob"] for r in rows if r["ji_blob"]]
+    for kind, p in conn.execute(
+            "SELECT kind, payload FROM raw_capture WHERE kind IN ('ji', 'ji_blob_legacy')"):
+        payloads.append(p[8:216] if kind == "ji" else p)
+    for p in payloads:
+        info = decode_ji_info(p, SERIAL)
+        if info and info["ink"]:
+            ink_owner[tuple(info["ink"][ch] for ch in INK_CHANNELS)].add(info["counter"])
+    name_of = {r["counter"]: r["job_name"] for r in alive.values() if r["counter"] is not None}
+    for r in alive.values():
+        if r["counter"] is None or _ink_total(r) is None:
+            continue
+        vec = tuple(None if r[k] is None else round(r[k]) for k in INK_COLS)
+        owners = ink_owner.get(vec, set()) - {r["counter"]}
+        if not owners or r["counter"] in ink_owner.get(vec, set()):
+            continue
+        never_printed = r["status_code"] == 0 and not r["print_secs"]
+        # Prefix compare: multi-file jobs are named "a.tif, b.tif, …".
+        if never_printed or any((name_of.get(o) or "")[:15] != r["job_name"][:15]
+                                for o in owners):
+            R.log(r["job_id"], "clear_borrowed_ink",
+                  {"old_ink": _ink_total(r), "owners": sorted(owners), "sent_at": r["sent_at"]})
+            R.exec("UPDATE jobs SET %s WHERE job_id = ?"
+                   % ", ".join(k + " = NULL" for k in INK_COLS), (r["job_id"],))
+            for k in INK_COLS:
+                r[k] = None
+
     # 4. Old-tool CSV as authority for the jobs it covers.
     unmatched = []
     if args.csv:
