@@ -267,14 +267,19 @@ def upsert_jobs(records: list[JobRecord],
 
             jid = existing["job_id"]
             changed = False
-            # Fill identity fields a bad earlier pull left empty.
-            if (existing["start_time"] is None and start) or \
-               (existing["end_time"] is None and end):
+            # Fill fields a bad earlier pull left empty (e.g. a row read while
+            # the printer hadn't filled length/status yet); never overwrite.
+            fill = {"start_time": start, "end_time": end,
+                    "print_secs": rec.print_secs, "width_mm": rec.width_mm,
+                    "length_mm": rec.length_mm, "area_cm2": rec.area_cm2,
+                    "media_type_id": rec.media_type_id,
+                    "status_code": rec.status_code}
+            fill = {k: v for k, v in fill.items()
+                    if v is not None and existing[k] is None}
+            if fill:
                 conn.execute(
-                    "UPDATE jobs SET start_time = COALESCE(start_time, ?), "
-                    "end_time = COALESCE(end_time, ?), "
-                    "print_secs = COALESCE(print_secs, ?) WHERE job_id = ?",
-                    (start, end, rec.print_secs, jid))
+                    "UPDATE jobs SET %s WHERE job_id = ?"
+                    % ", ".join(k + " = ?" for k in fill), (*fill.values(), jid))
                 changed = True
             if rec.ink_use:
                 old = [existing["InkUse_" + ch] for ch in ink_ch]
