@@ -689,6 +689,11 @@ def fetch_job_log(host: str, community: str = "public",
 
     rows = _fetch_rows_atomic(host, community, timeout)
     if rows is None:
+        # Distinguish "printer off / unreachable" from "won't do multi-varbind
+        # GETs": only the latter is worth the slow column-walk fallback.
+        if _snmp_send(host, _snmp_pkt(0xa1, community, _col_root(2)), timeout) is None:
+            log.warning("  printer %s not answering SNMP — skipping this pull", host)
+            return []
         log.warning("  multi-varbind GET not supported; falling back to column walk")
         rows = _fetch_rows_walk(host, community, timeout)
     log.info("  Found %d job entries", len(rows))
