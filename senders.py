@@ -68,20 +68,33 @@ def job_payload(job: dict, include_article: bool = True) -> dict:
     return payload
 
 
-def _post(url: str, body: dict) -> dict:
+class SendTimeout(SendError):
+    """The request went out but no response arrived in time. The server may
+    still have processed it, so the outcome is unknown (don't blindly resend)."""
+
+
+def _post(url: str, body: dict, timeout: float = 30) -> dict:
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("Authorization", "Bearer %s" % _token())
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             return {"status": resp.status, "body": raw}
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")
         raise SendError("Endpoint returned HTTP %s: %s" % (e.code, detail.strip()))
     except urllib.error.URLError as e:
+        if isinstance(e.reason, TimeoutError):
+            raise SendError("Timed out connecting to endpoint (nothing was sent).")
         raise SendError("Could not reach endpoint: %s" % e.reason)
+    except TimeoutError:
+        # Connected and sent the body, but the response didn't arrive in time.
+        raise SendTimeout(
+            "No response from endpoint within %ss. The server may still have "
+            "recorded the data. Check the shop before resending, or jobs may be "
+            "billed twice. Jobs were NOT marked as sent locally." % timeout)
 
 
 def post_single(job: dict) -> dict:
@@ -95,4 +108,5 @@ def post_batch(jobs: list[dict]) -> dict:
         "articleNumber": ARTICLE_NUMBER,
         "jobs": [job_payload(j, include_article=False) for j in jobs],
     }
-    return _post(BASE_URL + "/batch", body)
+    # A month of jobs can take the server a while to process.
+    return _post(BASE_URL + "/batch", body, timeout=180)
