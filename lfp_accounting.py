@@ -295,16 +295,32 @@ def cmd_send_batch(args):
             "" if args.resend else " (all already sent, or none with user+ink)"))
         return
 
-    try:
-        result = senders.post_batch(sendable)
-    except senders.SendError as e:
-        print("Batch send failed: %s" % e)
-        sys.exit(1)
+    # Send in chunks and mark each chunk sent as soon as the shop confirms it,
+    # so a failure part-way only leaves the unconfirmed remainder unsent.
+    parts = list(senders.chunks(sendable))
+    sent = 0
+    total_ml = 0.0
+    for n, part in enumerate(parts, 1):
+        try:
+            result = senders.post_batch(part)
+        except senders.SendError as e:
+            print("Chunk %d/%d failed: %s" % (n, len(parts), e))
+            print("%d of %d job(s) sent and marked." % (sent, len(sendable)))
+            if senders.JOB_ID_FIELD:
+                print("Re-run send-batch to send the rest; the shop skips jobs "
+                      "it already has (same job ids).")
+            else:
+                print("The failed chunk may or may not be stored in the shop. "
+                      "Check the shop before re-running, or those jobs may be "
+                      "billed twice.")
+            sys.exit(1)
+        mark_sent([j["job_id"] for j in part])
+        sent += len(part)
+        total_ml += sum(senders.job_quantity_ml(j) for j in part)
+        print("Chunk %d/%d: sent %d job(s) — HTTP %s" % (
+            n, len(parts), len(part), result["status"]))
 
-    mark_sent([j["job_id"] for j in sendable])
-    total_ml = round(sum(senders.job_quantity_ml(j) for j in sendable), 2)
-    print("Sent %d job(s), %s ml total — HTTP %s" % (
-        len(sendable), total_ml, result["status"]))
+    print("Sent %d job(s), %s ml total." % (sent, round(total_ml, 2)))
     if skipped:
         print("Skipped %d job(s) (no user/ink data)." % skipped)
 
